@@ -6,7 +6,7 @@ Let low-frequency tools load on demand, the way Skills do, inside pi.
 >
 > npm package: @wolido/pi-lazy-tools
 
-The tools the main agent can call, and the multi-kilobyte manuals attached to each of them, largely decide what it can do. Those manuals appear in full on every request, including the ones used in maybe 5% of sessions: the agent has to re-read all of them every round to find what the current task actually needs. Diluted attention costs far more than the extra tokens; the bill is just the most visible part of it. We worked out this "clean context" philosophy at the subagent level with [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation), where the main agent only assigns work and never touches task details. The tool dimension has the same problem left: low-frequency definitions are present every round (the economics: 60 requests × 3 KB is 180 KB of traffic for a tool used once every few days).
+The tools the main agent can call, and the multi-kilobyte manuals attached to each of them, largely decide what it can do. Those manuals appear in full on every request, including the ones used in maybe 5% of sessions: the agent has to re-read all of them every round to find what the current task actually needs. We worked out this "clean context" philosophy at the subagent level with [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation), where the main agent only assigns work and never touches task details. The tool dimension has the same problem left: low-frequency definitions are present every round.
 
 Skills solve the same problem with progressive disclosure: load only what is needed. pi-lazy-tools applies that idea to tools. Registration stays as-is (the `--tools` whitelist and pi runtime metadata are untouched); at session start the listed tools are removed from the LLM-visible active set, granular to individual tools, so a single extension can be partially hidden. When one is needed, `load_tools` injects its usage instructions as plain text and `call_tool` executes on its behalf; the actual execution is always the target extension's own `execute`. After the removal, the context holds only the tools the agent actually uses; attention stops being spent on low-frequency manuals. Because the tools field and the system prompt never change during a session, lazy loading never invalidates the cache, on any model (argument in [How it works](#how-it-works)).
 
@@ -193,7 +193,7 @@ Costs:
 
 pi-lazy-extensions lazy-loads whole extensions: it dynamically imports entire extension modules via jiti, saving extension load cost, and it has known defects such as sourceInfo attribution errors (experimental project).
 
-This design optimizes what each request carries in context: low-frequency definitions occupy attention every round, compounding as sessions lengthen and retries accumulate (the token bill grows along). Granularity therefore has to be per tool; tools of the same extension can be hidden selectively, named individually in `lazy-tools.json`.
+This design optimizes what each request carries in context: low-frequency definitions occupy attention every round, more so as sessions lengthen and retries accumulate. Granularity therefore has to be per tool; tools of the same extension can be hidden selectively, named individually in `lazy-tools.json`.
 
 #### Why no need to strip guidelines from the system prompt
 
@@ -240,7 +240,7 @@ The replay load and pi's extension load must resolve to the same module instance
 
 #### When lazy-loading pays off
 
-Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of one extra `load_tools` round-trip and the `call_tool` indirection per use (the saved tokens are a side benefit). Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools out of the list.
+Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of one extra `load_tools` round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools out of the list.
 
 #### Troubleshooting
 
