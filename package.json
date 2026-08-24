@@ -1,0 +1,60 @@
+{
+  "name": "@wolido/pi-lazy-tools",
+  "version": "0.1.0",
+  "description": "让低频工具像 Skill 一样按需加载的 pi 扩展",
+  "license": "MIT",
+  "author": "Wolido",
+  "type": "module",
+  "main": "./lazy-tools.ts",
+  "types": "./lazy-tools.ts",
+  "files": [
+    "lazy-tools.ts",
+    "lazy-tools/",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "lazy-load",
+    "tools",
+    "context"
+  ],
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wolido/pi-lazy-tools.git"
+  },
+  "homepage": "https://github.com/Wolido/pi-lazy-tools#readme",
+  "bugs": {
+    "url": "https://github.com/Wolido/pi-lazy-tools/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/core.test.ts test/integration.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./lazy-tools.ts"
+    ]
+  }
+}
