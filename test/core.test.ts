@@ -9,6 +9,7 @@
  *   filterAllowedTools(requested, whitelist)             -> { allowed, rejected }
  *   validateParams(schema, params)                       -> { ok, errors }
  *   canCall(tool, whitelist, activatedSet)               -> { ok, reason }
+ *   buildStartupNotice(input)                            -> string
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -18,6 +19,9 @@ import {
 	filterAllowedTools,
 	validateParams,
 	canCall,
+	selectEffectiveConfigPath,
+	buildStartupNotice,
+	StartupNoticeInput,
 } from "../lazy-tools/core.ts";
 
 // ===== Shared fixtures =====
@@ -347,8 +351,6 @@ describe("validateParams (revive_subagent-style schema)", () => {
 	});
 });
 
-// ===== canCall =====
-
 // ===== validateParams: review-driven regressions（第二轮审查问题） =====
 
 describe("validateParams (review-driven regressions)", () => {
@@ -421,5 +423,188 @@ describe("canCall", () => {
 	it("should reject an empty tool name", () => {
 		const result = canCall("", ["revive_subagent"], new Set(["revive_subagent"]));
 		assert.equal(result.ok, false);
+	});
+});
+
+// ===== selectEffectiveConfigPath（新契约） =====
+
+describe("selectEffectiveConfigPath", () => {
+	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
+	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
+
+	// 项目级含有效 lazy 数组（非空）→ 项目级，即使用户级同样有效
+	it("should pick the project path when the project config has a non-empty lazy array", () => {
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: ["p1", "p2"] }, USER_PATH, PROJECT_PATH),
+			PROJECT_PATH,
+		);
+	});
+
+	// 项目级空数组 → 仍算有效（显式覆盖用户级），返回项目级
+	it("should pick the project path when the project config has an empty lazy array", () => {
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: [] }, USER_PATH, PROJECT_PATH),
+			PROJECT_PATH,
+		);
+	});
+
+	// 项目级 lazy 非数组 → 视为无效，回退用户级
+	it("should fall back to the user path when the project lazy field is not an array", () => {
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: "oops" }, USER_PATH, PROJECT_PATH),
+			USER_PATH,
+		);
+	});
+
+	// 项目级缺失（null）→ 回退用户级
+	it("should fall back to the user path when the project config is missing", () => {
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: ["u"] }, null, USER_PATH, PROJECT_PATH),
+			USER_PATH,
+		);
+	});
+
+	// 非字符串项被过滤但不影响数组本身的有效性（与 mergeLazyConfigs 同源）
+	it("should still treat the project array as valid when it contains non-string entries", () => {
+		const project = { lazy: ["p", 1, null, true, { x: 1 }] };
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: ["u"] }, project, USER_PATH, PROJECT_PATH),
+			PROJECT_PATH,
+		);
+	});
+
+	// 两者皆无有效 lazy 数组 → null
+	it("should return null when neither config has a valid lazy array", () => {
+		assert.equal(
+			selectEffectiveConfigPath({ lazy: 42 }, { other: "x" }, USER_PATH, PROJECT_PATH),
+			null,
+		);
+	});
+
+	// 两者全空/缺失 → null（与 mergeLazyConfigs 返回 { lazy: [] } 的语义同源）
+	it("should return null when both configs are null or empty", () => {
+		assert.equal(selectEffectiveConfigPath(null, null, USER_PATH, PROJECT_PATH), null);
+		assert.equal(selectEffectiveConfigPath({}, {}, USER_PATH, PROJECT_PATH), null);
+	});
+});
+
+// ===== buildStartupNotice（新契约） =====
+
+describe("buildStartupNotice (新契约)", () => {
+	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
+	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
+
+	function makeInput(overrides: Partial<StartupNoticeInput> = {}): StartupNoticeInput {
+		return {
+			toolNames: ["revive_subagent"],
+			userConfigPath: USER_PATH,
+			projectConfigPath: PROJECT_PATH,
+			effectiveConfigPath: PROJECT_PATH,
+			...overrides,
+		};
+	}
+
+	// 情况一（effectiveConfigPath 非 null）：名单 + 空行 + 「当前生效的配置文件为：」+ 生效路径
+	it("should state the effective config path after the tool list when a config is effective", () => {
+		const text = buildStartupNotice(makeInput());
+
+		assert.ok(text.includes("当前 lazy 工具名单："), `notice should have the list header; got: ${text}`);
+		assert.ok(text.includes("- revive_subagent"), `notice should list the tool; got: ${text}`);
+		assert.ok(
+			text.includes("\n\n"),
+			`notice should separate the list and the config line with a blank line; got: ${JSON.stringify(text)}`,
+		);
+		assert.ok(
+			text.includes("当前生效的配置文件为："),
+			`notice should mark the effective config; got: ${text}`,
+		);
+		assert.ok(text.includes(PROJECT_PATH), `notice should mention the effective path; got: ${text}`);
+	});
+
+	// 情况一：多工具 → 每个工具名逐行列出
+	it("should list every tool name on its own line when multiple tools are effective", () => {
+		const text = buildStartupNotice(
+			makeInput({ toolNames: ["revive_subagent", "openaas", "git_mirror"] }),
+		);
+
+		assert.ok(text.includes("- revive_subagent"), `notice should list revive_subagent; got: ${text}`);
+		assert.ok(text.includes("- openaas"), `notice should list openaas; got: ${text}`);
+		assert.ok(text.includes("- git_mirror"), `notice should list git_mirror; got: ${text}`);
+		assert.ok(
+			text.includes("当前生效的配置文件为："),
+			`notice should mark the effective config; got: ${text}`,
+		);
+		assert.ok(text.includes(PROJECT_PATH), `notice should mention the effective path; got: ${text}`);
+	});
+
+	// 情况一：空名单 → （空）标注，不列任何工具名
+	it("should mark an empty tool list with （空） when a config is effective", () => {
+		const text = buildStartupNotice(makeInput({ toolNames: [] }));
+
+		assert.ok(text.includes("（空）"), `notice should mark the empty list; got: ${text}`);
+		assert.ok(
+			text.includes("当前生效的配置文件为："),
+			`notice should still state the effective config; got: ${text}`,
+		);
+		assert.ok(text.includes(PROJECT_PATH), `notice should mention the effective path; got: ${text}`);
+	});
+
+	// 情况一：推翻旧契约的逐侧标注——只陈述生效路径，不列用户级/项目级位置
+	it("should not mention the user/project config locations individually when a config is effective", () => {
+		const text = buildStartupNotice(makeInput());
+
+		assert.ok(
+			!text.includes("用户级"),
+			`case 1 must not list the user-level location; got: ${text}`,
+		);
+		assert.ok(
+			!text.includes("项目级"),
+			`case 1 must not list the project-level location; got: ${text}`,
+		);
+	});
+
+	// 情况二（effectiveConfigPath 为 null）：双路径分别列出 + 空行 + 「以上两个文件均不存在」，名单为（空）
+	it("should list both config locations and the both-missing notice when nothing is effective", () => {
+		const text = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+
+		assert.ok(text.includes("（空）"), `notice should mark the empty list; got: ${text}`);
+		assert.ok(
+			text.includes("当前暂无配置文件："),
+			`notice should mark no-config; got: ${text}`,
+		);
+		assert.ok(
+			text.includes(`用户级：${USER_PATH}`),
+			`notice should list the user-level path; got: ${text}`,
+		);
+		assert.ok(
+			text.includes(`项目级：${PROJECT_PATH}`),
+			`notice should list the project-level path; got: ${text}`,
+		);
+		assert.ok(
+			text.includes("\n\n以上两个文件均不存在"),
+			`notice should end with a blank line and the both-missing line; got: ${JSON.stringify(text)}`,
+		);
+	});
+
+	// 情况二：无生效路径时不得出现「当前生效的配置文件为：」
+	it("should not claim an effective config when the effective path is null", () => {
+		const text = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+
+		assert.ok(
+			!text.includes("当前生效的配置文件为："),
+			`notice must not claim an effective config; got: ${text}`,
+		);
+	});
+
+	// 措辞禁令：两种情况都不得包含「当前激活」「如需修改」「路径都没有找到」
+	it("should never contain any banned phrasing (当前激活 / 如需修改 / 路径都没有找到)", () => {
+		const case1 = buildStartupNotice(makeInput());
+		const case2 = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+
+		for (const text of [case1, case2]) {
+			assert.ok(!text.includes("当前激活"), `banned phrase 当前激活; got: ${text}`);
+			assert.ok(!text.includes("如需修改"), `banned phrase 如需修改; got: ${text}`);
+			assert.ok(!text.includes("路径都没有找到"), `banned phrase 路径都没有找到; got: ${text}`);
+		}
 	});
 });

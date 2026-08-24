@@ -20,9 +20,11 @@ import { join } from "node:path";
 import * as fs from "node:fs";
 import {
 	mergeLazyConfigs,
+	selectEffectiveConfigPath,
 	filterAllowedTools,
 	validateParams,
 	canCall,
+	buildStartupNotice,
 	type LazyConfig,
 } from "./lazy-tools/core.ts";
 
@@ -262,20 +264,44 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		try {
 			const cwd = ctx.cwd ?? process.cwd();
-			const userConfig = readConfigFile(join(homedir(), ".pi", CONFIG_NAME));
-			const projectConfig = readConfigFile(join(cwd, ".pi", CONFIG_NAME));
+			const userConfigPath = join(homedir(), ".pi", CONFIG_NAME);
+			const projectConfigPath = join(cwd, ".pi", CONFIG_NAME);
+			const userConfig = readConfigFile(userConfigPath);
+			const projectConfig = readConfigFile(projectConfigPath);
 			lazyNames = mergeLazyConfigs(userConfig, projectConfig).lazy;
 			lazySet = new Set(lazyNames);
 			activated.clear();
 			definitionCache.clear();
 
+			const effectiveConfigPath = selectEffectiveConfigPath(
+				userConfig,
+				projectConfig,
+				userConfigPath,
+				projectConfigPath,
+			);
+			const notice = buildStartupNotice({
+				toolNames: lazyNames,
+				userConfigPath,
+				projectConfigPath,
+				effectiveConfigPath,
+			});
+
 			const active = pi.getActiveTools();
 			const filtered = active.filter((toolName) => !lazySet.has(toolName));
 			const initial = [...new Set([...filtered, LOADER_NAME, CALLER_NAME])];
 			pi.setActiveTools(initial);
+
+			if (event?.reason === "startup") {
+				try {
+					ctx?.ui?.notify?.(notice, "info");
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					console.warn(`[lazy-tools] failed to show startup notice: ${message}`);
+				}
+			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			console.warn(`[lazy-tools] session_start handler failed: ${message}`);

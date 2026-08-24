@@ -29,6 +29,13 @@ export interface CanCallResult {
 	reason: string;
 }
 
+export interface StartupNoticeInput {
+	toolNames: string[];
+	userConfigPath: string;
+	projectConfigPath: string;
+	effectiveConfigPath: string | null;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -208,6 +215,31 @@ export function validateParams(schema: unknown, params: unknown): ValidationResu
 	return { ok: errors.length === 0, errors };
 }
 
+function hasValidLazyArray(cfg: LazyConfig | null): boolean {
+	return isObject(cfg) && Array.isArray(cfg.lazy);
+}
+
+/**
+ * Select which config path is currently effective.
+ *
+ * - If the project config contains a valid `lazy` array (empty array counts),
+ *   the project path wins.
+ * - Otherwise fall back to the user config if it contains a valid `lazy` array.
+ * - If neither config has a valid `lazy` array, return null.
+ *
+ * Non-string entries inside the array do not affect the array's validity.
+ */
+export function selectEffectiveConfigPath(
+	userCfg: LazyConfig | null,
+	projectCfg: LazyConfig | null,
+	userPath: string,
+	projectPath: string,
+): string | null {
+	if (hasValidLazyArray(projectCfg)) return projectPath;
+	if (hasValidLazyArray(userCfg)) return userPath;
+	return null;
+}
+
 /**
  * Check whether a lazy tool may be invoked through call_tool.
  *
@@ -229,4 +261,37 @@ export function canCall(
 		};
 	}
 	return { ok: true, reason: "" };
+}
+
+/**
+ * Build the startup notice text shown when a session starts.
+ *
+ * Lists the merged lazy tool names and states which configuration file is
+ * currently effective. When no config is effective, both candidate locations
+ * are listed together with a note that neither file exists.
+ */
+export function buildStartupNotice(input: StartupNoticeInput): string {
+	const lines: string[] = [];
+	lines.push("当前 lazy 工具名单：");
+	if (input.toolNames.length === 0) {
+		lines.push("（空）");
+	} else {
+		for (const name of input.toolNames) {
+			lines.push(`- ${name}`);
+		}
+	}
+	lines.push("");
+
+	if (input.effectiveConfigPath !== null) {
+		lines.push("当前生效的配置文件为：");
+		lines.push(input.effectiveConfigPath);
+	} else {
+		lines.push("当前暂无配置文件：");
+		lines.push(`用户级：${input.userConfigPath}`);
+		lines.push(`项目级：${input.projectConfigPath}`);
+		lines.push("");
+		lines.push("以上两个文件均不存在");
+	}
+
+	return lines.join("\n");
 }
