@@ -14,6 +14,7 @@ Skills solve the same problem with progressive disclosure: load only what is nee
 
 - [Quick start](#quick-start)
 - [Usage](#usage)
+- [Startup notice](#startup-notice)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
 - [Design details and lessons learned](#design-details-and-lessons-learned)
@@ -99,6 +100,35 @@ Four gates; the target tool is never touched if any of them fails:
 - `call_tool` requires the target to be activated via `load_tools` first; unactivated calls are rejected with a hint to load first
 - Activation is per-session memory, cleared at session start
 - Both resident tools' promptGuidelines already state the "load_tools first, then call_tool" order in the system prompt
+
+## Startup notice
+
+When a session starts with `reason === "startup"` in session_start, the extension prints a notice via `ctx.ui.notify`: the current lazy tool list and the path of the config file in effect. Other start reasons (new / resume / fork / reload) print nothing.
+
+With a config in effect, the notice looks like:
+
+```
+Current lazy tool list:
+- deploy_tool
+
+Config file in effect:
+~/.pi/lazy-tools.json
+```
+
+Which config wins follows the [Configuration](#configuration) merge rules: the project config when it has a `lazy` array, otherwise the user config. When neither location has a config with a `lazy` array, the notice lists both candidate paths and states that neither exists; the list is then necessarily empty, because it comes from the config files:
+
+```
+Current lazy tool list:
+(empty)
+
+No config file present:
+user-level: ~/.pi/lazy-tools.json
+project-level: <cwd>/.pi/lazy-tools.json
+
+Neither file exists
+```
+
+The notice is informational only and never touches core logic: list removal and setActiveTools run as usual. If `ctx.ui.notify` is unavailable or throws, the notice is skipped silently (console.warn only); the session is unaffected.
 
 ## Configuration
 

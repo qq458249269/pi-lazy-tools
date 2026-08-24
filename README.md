@@ -14,6 +14,7 @@ Skills 对同类问题的解法是渐进式披露（progressive disclosure）：
 
 - [快速上手](#快速上手)
 - [使用](#使用)
+- [启动提示](#启动提示)
 - [配置](#配置)
 - [工作原理](#工作原理)
 - [设计细节与踩坑记录](#设计细节与踩坑记录)
@@ -103,6 +104,35 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 - `call_tool` 要求目标工具先经过 `load_tools` 激活，未激活的调用直接拒绝并提示先加载
 - 激活状态是会话级记忆，会话开始清空
 - 两个常驻工具的 promptGuidelines 已把「先 load_tools 再 call_tool」的顺序写进系统提示词
+
+## 启动提示
+
+会话以 startup 原因启动（session_start 的 `reason === "startup"`）时，扩展通过 `ctx.ui.notify` 打印一条提示：当前 lazy 工具名单，以及当前生效的配置文件路径。new / resume / fork / reload 等其余启动原因不打印。
+
+有生效配置时，提示形如：
+
+```
+当前 lazy 工具名单：
+- deploy_tool
+
+当前生效的配置文件为：
+~/.pi/lazy-tools.json
+```
+
+生效配置按[配置](#配置)的合并规则判定：项目级配置含 `lazy` 数组时项目级生效，否则回落到用户级。用户级、项目级都没有含 `lazy` 数组的配置时，提示列出两个候选路径并注明均不存在；此时名单必为空，因为名单只来源于配置文件：
+
+```
+当前 lazy 工具名单：
+（空）
+
+当前暂无配置文件：
+用户级：~/.pi/lazy-tools.json
+项目级：<cwd>/.pi/lazy-tools.json
+
+以上两个文件均不存在
+```
+
+提示只做告知，不影响核心逻辑：名单剔除与 setActiveTools 照常执行；`ctx.ui.notify` 不可用或抛错时静默跳过（仅 console.warn），不打断会话。
 
 ## 配置
 

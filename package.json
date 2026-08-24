@@ -1,6 +1,6 @@
 {
   "name": "@wolido/pi-lazy-tools",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "让低频工具像 Skill 一样按需加载的 pi 扩展",
   "license": "MIT",
   "author": "Wolido",
