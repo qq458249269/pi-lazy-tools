@@ -37,9 +37,13 @@ Current approach (manual copy, until the package is published): copy `lazy-tools
 lazy-tools/
 ├── README.md
 ├── lazy-tools.ts        # extension entry: config loading, session_start, the two resident tools
-└── lazy-tools/
-    └── core.ts          # pure logic layer: no pi runtime, no typebox, unit-testable
-lazy-tools-tests/        # 52 tests (node:test + tsx)
+├── lazy-tools/
+│   └── core.ts          # pure logic layer: no pi runtime, no typebox, unit-testable
+└── test/                # 88 tests (node:test + tsx)
+    ├── core.test.ts
+    ├── integration.test.ts
+    └── fixtures/
+        └── fake-target.ts
 ```
 
 Three more steps after installation:
@@ -48,7 +52,7 @@ Three more steps after installation:
 2. Keep lazy tools in the `--tools` whitelist of the launch command (registration and hiding are two separate things, see [Configuration](#configuration))
 3. Start a new session (extensions load at session start; an old session has no `load_tools`)
 
-typebox: the extension imports typebox directly (the same one pi uses). If loading fails with a missing typebox, follow the symlink bridge described in lazy-tools-tests/README.md.
+typebox: the extension imports typebox directly (the same one pi uses; it lives in the root node_modules).
 
 ### Minimal config
 
@@ -69,20 +73,38 @@ Go through the tools registered in pi's tool list: anything with a long descript
 
 ### Usage example
 
-Tell the main agent: "activate deploy_tool and deploy the current version to staging". The main agent runs two steps on its own:
+Tell the main agent: "activate deploy_tool and deploy the current version to staging". The flow has three steps:
 
 1. `load_tools({ tools: ["deploy_tool"] })`
-   returns plain text: description, parameter JSON Schema, guidelines
-2. `call_tool({ tool: "deploy_tool", params: { env: "staging" } })`
+   zero side effects; returns only a challenge text and activates nothing. The challenge lists each tool's name and description, states that this call loaded or activated nothing, warns that after confirmation the tools will be activated (per-session) and callable via call_tool, and spells out the exact second-call shape
+2. `load_tools({ tools: ["deploy_tool"], confirm: true })`
+   activates the tools for real and returns the usage instructions: description, parameter JSON Schema, guidelines
+3. `call_tool({ tool: "deploy_tool", params: { env: "staging" } })`
    deploy_tool executes for real, the result is passed through unchanged
 
-You can also give the task without naming the tool; the main agent decides whether the lazy-load flow is needed.
+The second step must rest on an explicit user request to load: naming "activate deploy_tool" counts. When the user names no tool, the main agent must not load a tool merely because it judged the task needs one; it should ask the user first.
 
 ## Usage
 
 ### load_tools: on-demand usage injection
 
-`load_tools` registers nothing and activates nothing. It reads the target tool's description, parameter JSON Schema (pretty-printed) and promptGuidelines from `getAllTools()` (runtime metadata available after registration, independent of active state), assembles them into a Markdown text block, and appends it to the message stream as a tool_result. The model reads the usage like a document. The tools field and the system prompt are never touched.
+`load_tools` has a two-step confirmation gate: the `confirm` parameter is an optional boolean, defaulting to false. A call without `confirm: true` has zero side effects: it registers nothing, activates nothing, and only returns a challenge text (with `confirmRequired: true` in details):
+
+```
+Load confirmation: the tools below will be activated after confirmation and become callable via call_tool. This call loaded or activated nothing.
+
+Note: only load tools when the user explicitly asks for them; before confirming the load, make sure this is something the user explicitly asked for.
+
+- deploy_tool: <description>
+
+To confirm the load, call again: load_tools({ tools: ["deploy_tool"], confirm: true })
+```
+
+The challenge lists each tool to be loaded with its name and description, states that nothing was loaded or activated by this call, warns that after confirmation the tools will be activated (per-session) and callable via call_tool, and finally spells out the exact second-call shape. The same "only on explicit user request" constraint is written into load_tools' own promptGuidelines: `"Only load tools when the user explicitly asks for them; never load on your own initiative."`
+
+Only a second call with `confirm: true` actually adds the tools to the per-session activated set and reads the target tool's description, parameter JSON Schema (pretty-printed) and promptGuidelines from `getAllTools()` (runtime metadata available after registration, independent of active state), assembling them into a Markdown text block appended to the message stream as a tool_result. The model reads the usage like a document. The tools field and the system prompt are never touched.
+
+Edge cases: an empty request returns a "no tools requested" notice directly; a request where every tool is off the lazy list returns a direct rejection. Neither case enters the confirmation gate, so no confirmRequired appears.
 
 Whitelist filtering: requesting a tool outside the list returns "Rejected (not in the lazy list)"; a tool inside the list but not registered returns "tool metadata not found" (usually the tool is missing from the `--tools` whitelist, see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
 
@@ -91,15 +113,15 @@ Whitelist filtering: requesting a tool outside the list returns "Rejected (not i
 Four gates; the target tool is never touched if any of them fails:
 
 1. Whitelist check: the target must be listed in lazy-tools.json
-2. Activation gate: it must first be activated via `load_tools` (activation is per-session memory, cleared at session start)
+2. Activation gate: it must first be activated via `load_tools({ tools: [...], confirm: true })` (activation is per-session memory, cleared at session start)
 3. JSON Schema pre-validation: supports the subset type / required / enum / pattern / properties / additionalProperties / items; invalid input returns field-path errors (e.g. `role: expected one of [admin, member], got "foo"`), and the target execute is not run
 4. Replay-capture execute: run the target extension's factory with a fake pi (createFakePi), intercept the ToolDefinition it registers via registerTool (including the real execute), memoized by `${sourcePath}#${name}` (each tool's factory replays at most once per session), then call `definition.execute` with the original params, signal, onUpdate and ctx; the result is returned unchanged
 
 ### Call order
 
-- `call_tool` requires the target to be activated via `load_tools` first; unactivated calls are rejected with a hint to load first
+- `call_tool` requires the target to be activated via `load_tools({ tools: [...], confirm: true })` first; unactivated calls are rejected with a hint showing the exact `load_tools({ tools: ["<tool name>"], confirm: true })` call
 - Activation is per-session memory, cleared at session start
-- Both resident tools' promptGuidelines already state the "load_tools first, then call_tool" order in the system prompt
+- Both resident tools' promptGuidelines state the "load_tools first, then call_tool" order; load_tools' guidelines also require loading only when the user explicitly asks. The exact confirm: true call shape is presented by the challenge text and call_tool's rejection hint for unactivated tools
 
 ## Startup notice
 
@@ -165,8 +187,14 @@ Session start (session_start, before the first request)
 main agent needs a tool
         ▼
 load_tools({ tools: ["deploy_tool"] })
-  whitelist filter → pull Description + parameter JSON Schema + Guidelines from getAllTools()
-  assemble a plain-text tool_result, append at the end of the message stream
+  whitelist filter → return a challenge text (zero side effects, confirmRequired: true)
+  list target tool names and descriptions, warn about activation, spell out the confirm: true call shape
+        ▼
+user confirms the load is explicitly requested
+        ▼
+load_tools({ tools: ["deploy_tool"], confirm: true })
+  confirmation gate passed → tools join the per-session activated set
+  pull Description + parameter JSON Schema + Guidelines from getAllTools(), assemble a plain-text tool_result
         │
 main agent shapes params per the usage
         ▼
@@ -178,7 +206,7 @@ call_tool({ tool: "deploy_tool", params: { env: "staging" } })
 Four things worth knowing:
 
 - session_start (before the first request) is the only place the tools field is written; from then on the tools field and the system prompt stay frozen
-- `load_tools` assembles the target tool's description, parameter Schema and guidelines into a plain-text tool_result appended at the end of the message stream; the model reads it like a document
+- `load_tools` returns a zero-side-effect challenge on the first call; only a second call with `confirm: true` assembles the target tool's description, parameter Schema and guidelines into a plain-text tool_result appended at the end of the message stream; the model reads it like a document
 - `call_tool` passes four gates, then replays the target extension's factory to capture the real execute; the result is passed through unchanged
 - Consequently lazy loading never invalidates the cache, on any model or provider (argument below)
 
@@ -270,7 +298,7 @@ The replay load and pi's extension load must resolve to the same module instance
 
 #### When lazy-loading pays off
 
-Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of one extra `load_tools` round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools out of the list.
+Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of a two-step `load_tools` confirmation round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools out of the list.
 
 #### Troubleshooting
 
@@ -282,21 +310,20 @@ Lazy-loading keeps low-frequency definitions out of the main agent's context, at
 ### References
 
 - pi official docs, docs/extensions.md, "Dynamic Tool Loading": the official activation mechanism, native deferred model requirements, cache notes
-- lazy-tools-tests/README.md: test inventory, symlink bridge script, TDD regression log
 - pi-lazy-extensions (GitHub, experimental): extension-level lazy loading, the comparison baseline for the design decisions
 
 ## Development
 
-Tests live in `lazy-tools-tests/`, 52 cases (46 unit + 6 integration):
+Tests live in `test/`, 88 cases (68 unit + 20 integration):
 
 ```bash
-cd lazy-tools-tests
+cd pi-lazy-tools
 npm install
 npm test            # node --import tsx --test test/core.test.ts test/integration.test.ts
 npm run typecheck   # tsc --noEmit (strict mode)
 ```
 
-Coverage: config merging, whitelist filtering, schema pre-validation edge cases (invalid pattern, object schema without an explicit type, `__proto__` keys, required error messages) and the call_tool end-to-end wiring (unactivated call rejected, invalid params not executed, factory memoization, events.on stubbing). Integration tests load the extension source for real and depend on files outside the directory; they need the node_modules symlink bridge, see lazy-tools-tests/README.md.
+Coverage: config merging, whitelist filtering, schema pre-validation edge cases (invalid pattern, object schema without an explicit type, `__proto__` keys, required error messages), the load_tools two-step confirmation gate (challenge text content, confirm omitted or false activates nothing, confirm: true activates, empty and all-rejected requests skip the gate, the user-explicitly-asks constraint) and the call_tool end-to-end wiring (unactivated call rejected, invalid params not executed, factory memoization, events.on stubbing). Integration tests load the extension source for real.
 
 ## License
 

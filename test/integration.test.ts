@@ -45,6 +45,17 @@ interface RenderedResult {
 	details: { executed: boolean };
 }
 
+/** load_tools execute 的返回形态（两步确认断言用）。 */
+interface LoadToolsResult {
+	content: Array<{ type: string; text: string }>;
+	details: {
+		requested?: string[];
+		accepted?: string[];
+		rejected?: string[];
+		confirmRequired?: boolean;
+	};
+}
+
 type SessionReason = "startup" | "new" | "resume" | "fork" | "reload";
 
 /** session_start 事件的最小形态（handler 只消费 reason 字段）。 */
@@ -83,7 +94,7 @@ interface BootOptions {
 interface Harness {
 	boot(lazyNames?: string[], options?: BootOptions): Promise<void>;
 	cleanup(): void;
-	loadTools(names: string[]): Promise<unknown>;
+	loadTools(names: string[], options?: { confirm?: boolean }): Promise<unknown>;
 	callTool(tool: string, params: unknown): Promise<unknown>;
 	fakeEventsOnCalls(): number;
 	/** session_start 期间 ctx.ui.notify 收到的调用记录。 */
@@ -94,6 +105,8 @@ interface Harness {
 	getWorkspacePath(): string | undefined;
 	/** freshUserHome 架空出的临时 HOME（即 session 期间 os.homedir() 的值）；未架设时为 undefined。 */
 	getUserHomePath(): string | undefined;
+	/** 返回已注册工具中指定名的工具定义（未注册则返回 undefined）。 */
+	getRegisteredTool(name: string): Record<string, unknown> | undefined;
 }
 
 function globalCounter(key: string): number {
@@ -250,12 +263,12 @@ function createHarness(): Harness {
 			if (workspace) rmSync(workspace, { recursive: true, force: true });
 			workspace = undefined;
 		},
-		loadTools(names: string[]): Promise<unknown> {
+		loadTools(names: string[], options?: { confirm?: boolean }): Promise<unknown> {
 			const execute = loadToolsTool!.execute as (
 				id: unknown,
-				params: { tools: string[] },
+				params: { tools: string[]; confirm?: boolean },
 			) => Promise<unknown>;
-			return execute(undefined, { tools: names });
+			return execute(undefined, { tools: names, ...(options ?? {}) });
 		},
 		callTool(tool: string, params: unknown): Promise<unknown> {
 			const execute = callToolTool!.execute as (
@@ -279,6 +292,9 @@ function createHarness(): Harness {
 		},
 		getUserHomePath(): string | undefined {
 			return userHome;
+		},
+		getRegisteredTool(name: string): Record<string, unknown> | undefined {
+			return registered.find((t) => t.name === name);
 		},
 	};
 }
@@ -318,7 +334,14 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 	it("should refuse to call a whitelisted tool that has not been activated via load_tools", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
 			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /激活/);
+			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /confirm: true/);
 			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "target execute must not run");
+
+			// 新契约补充：首调只返回 challenge（confirm !== true 不激活），callTool 仍被拒
+			await h.loadTools([FAKE_TOOL_NAME]); // challenge only, 不激活
+			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /激活/);
+			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /confirm: true/);
+			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "challenge-only load 不得激活，目标 execute 仍不可运行");
 		});
 	});
 
@@ -333,7 +356,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 	// B8: 参数不合法 → 结构化错误（字段路径），目标不执行
 	it("should reject invalid target params with a field-path error and never execute the target", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
-			await h.loadTools([FAKE_TOOL_NAME]);
+			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await assert.rejects(
 				h.callTool(FAKE_TOOL_NAME, { action: "nope" }),
 				/action: expected one of \[discover, submit\], got "nope"/,
@@ -345,7 +368,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 	// B9: 合法参数 → 目标执行且结果透传
 	it("should invoke the target execute and pass through its result for valid params", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
-			await h.loadTools([FAKE_TOOL_NAME]);
+			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			const result = (await h.callTool(FAKE_TOOL_NAME, { action: "discover" })) as RenderedResult;
 			assert.match(result.content[0].text, /fake ran: discover/);
 			assert.equal(result.details.executed, true);
@@ -356,7 +379,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 	// B10: findToolDefinition 应按 (sourcePath, name) memoize —— factory 只跑一次
 	it("should load the target tool definition only once across repeated call_tool invocations", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
-			await h.loadTools([FAKE_TOOL_NAME]);
+			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await h.callTool(FAKE_TOOL_NAME, { action: "discover" });
 			await h.callTool(FAKE_TOOL_NAME, { action: "submit" });
 			assert.equal(
@@ -370,12 +393,155 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 	// B11: 目标 factory 里的 pi.events.on 不得订阅到真实 pi
 	it("should stub events.on on the fake pi so the target factory never subscribes to the real pi", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
-			await h.loadTools([FAKE_TOOL_NAME]);
+			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await h.callTool(FAKE_TOOL_NAME, { action: "discover" });
 			assert.equal(
 				h.fakeEventsOnCalls(),
 				0,
 				"createFakePi must stub pi.events.on so real pi is never subscribed",
+			);
+		});
+	});
+
+	// B12: 首调无 confirm → 返回挑战（content 含工具名/"confirm: true"），details.confirmRequired === true，零副作用
+	it("should return a challenge without activating anything when confirm is omitted", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([FAKE_TOOL_NAME])) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			// 挑战文本：含工具名 + 第二次调用形状
+			assert.ok(text.includes(FAKE_TOOL_NAME), `challenge 应列出工具名; got: ${text}`);
+			assert.ok(text.includes("confirm: true"), `challenge 应包含第二次调用形状 confirm: true; got: ${text}`);
+
+			// details.confirmRequired === true
+			assert.equal(result.details.confirmRequired, true, "details.confirmRequired 应为 true");
+
+			// 零副作用：未激活 → callTool 仍被拒，目标 execute 未运行
+			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /激活/);
+			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "challenge 不得触发目标 execute");
+		});
+	});
+
+	// B13: 首调显式 confirm:false → 同样返回挑战、不激活
+	it("should return a challenge and not activate when confirm is explicitly false", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([FAKE_TOOL_NAME], { confirm: false })) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			assert.ok(text.includes(FAKE_TOOL_NAME), `challenge 应列出工具名; got: ${text}`);
+			assert.ok(text.includes("confirm: true"), `challenge 应包含第二次调用形状; got: ${text}`);
+			assert.equal(result.details.confirmRequired, true, "details.confirmRequired 应为 true");
+
+			// 零副作用
+			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /激活/);
+			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "challenge 不得触发目标 execute");
+		});
+	});
+
+	// B14: confirm:true → 激活成功，callTool 正常执行
+	it("should activate and load tools when confirm is true", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([FAKE_TOOL_NAME], { confirm: true })) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			// 激活后返回使用说明（buildLoadResult 形态）
+			assert.ok(text.includes("已加载"), `confirm:true 应返回使用说明; got: ${text}`);
+			assert.ok(text.includes(FAKE_TOOL_NAME), `使用说明应含工具名; got: ${text}`);
+
+			// 激活后 callTool 正常执行
+			const callResult = (await h.callTool(FAKE_TOOL_NAME, { action: "discover" })) as RenderedResult;
+			assert.match(callResult.content[0].text, /fake ran: discover/);
+			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 1, "confirm:true 后目标 execute 应运行一次");
+		});
+	});
+
+	// B15: 全部不在名单（rejected 非空、accepted 空）→ 直接返回拒绝结果，不进确认门
+	it("should reject immediately without a challenge when nothing is on the lazy whitelist", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools(["not_on_whitelist"], { confirm: false })) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			// 拒绝结果：不在 lazy 名单
+			assert.ok(text.includes("拒绝"), `应返回拒绝结果; got: ${text}`);
+			assert.ok(text.includes("not_on_whitelist"), `拒绝结果应含请求的工具名; got: ${text}`);
+
+			// 不进确认门：无 confirmRequired，文本无 challenge 形态
+			assert.equal(result.details.confirmRequired, undefined, "全部 rejected 时 confirmRequired 应为 undefined");
+			assert.ok(!text.includes("confirm: true"), `拒绝结果不应包含 challenge 第二次调用形状; got: ${text}`);
+		});
+	});
+
+	// B16: 空数组请求 → 现有行为（"没有请求任何工具。"），不进确认门
+	it("should return the no-request notice without a challenge for an empty tools array", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([], { confirm: false })) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			assert.ok(text.includes("没有请求任何工具。"), `空数组应返回"没有请求任何工具。"; got: ${text}`);
+			assert.equal(result.details.confirmRequired, undefined, "空请求时 confirmRequired 应为 undefined");
+		});
+	});
+
+	// B17: 首调无 confirm → challenge 文本含「用户主动要求」提示（约束层：仅在用户主动要求时才加载工具）
+	it("should include a user-explicitly-asks constraint in the challenge text (integration)", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([FAKE_TOOL_NAME])) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			// 锁定的措辞：文本须同时含"用户"与"主动要求"（或"用户主动"）
+			assert.ok(
+				(text.includes("用户") && text.includes("主动要求")) || text.includes("用户主动"),
+				`challenge 应含「仅在用户主动要求时才加载工具」类提示; got: ${text}`,
+			);
+		});
+	});
+
+	// B17b: 混合请求边界（白名单内 + 白名单外，confirm 缺省）→ 返回挑战，rejected 不进挑战文本
+	it("should return a challenge for whitelisted tools while rejecting off-whitelist tools, without leaking rejected names into the challenge text", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const result = (await h.loadTools([FAKE_TOOL_NAME, "not_on_whitelist"])) as LoadToolsResult;
+			const text = result.content[0].text;
+
+			// 返回 challenge 形态
+			assert.ok(text.includes(FAKE_TOOL_NAME), `challenge 应列出白名单内工具名; got: ${text}`);
+			assert.ok(text.includes("confirm: true"), `challenge 应包含第二次调用形状; got: ${text}`);
+			assert.equal(result.details.confirmRequired, true, "含白名单内工具时 confirmRequired 应为 true");
+
+			// rejected 含 not_on_whitelist
+			assert.ok(
+				(result.details.rejected ?? []).includes("not_on_whitelist"),
+				`details.rejected 应含 not_on_whitelist; got: ${JSON.stringify(result.details.rejected)}`,
+			);
+
+			// accepted 含 FAKE_TOOL_NAME
+			assert.ok(
+				(result.details.accepted ?? []).includes(FAKE_TOOL_NAME),
+				`details.accepted 应含 ${FAKE_TOOL_NAME}; got: ${JSON.stringify(result.details.accepted)}`,
+			);
+
+			// 锁定：rejected 不进挑战文本
+			assert.ok(
+				!text.includes("not_on_whitelist"),
+				`challenge 文本不得含被拒绝工具名（锁定 rejected 不进挑战文本）; got: ${text}`,
+			);
+		});
+	});
+
+	// B18: 注册的 load_tools 工具的 promptGuidelines 包含用户主动要求约束
+	it("should register load_tools with a user-explicitly-asks prompt guideline", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const tool = h.getRegisteredTool("load_tools");
+			assert.ok(tool !== undefined, "load_tools should be registered");
+
+			const guidelines = (tool as Record<string, unknown>).promptGuidelines as string[] | undefined;
+			assert.ok(Array.isArray(guidelines), "load_tools should have promptGuidelines");
+			assert.ok(
+				guidelines!.some(
+					(g) =>
+						(g.includes("user") && (g.includes("explicitly") || g.includes("ask"))) ||
+						(g.includes("用户") && (g.includes("主动") || g.includes("要求"))),
+				),
+				`load_tools promptGuidelines 应含「仅在用户主动要求时才加载工具」类约束; got: ${JSON.stringify(guidelines)}`,
 			);
 		});
 	});

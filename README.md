@@ -37,9 +37,9 @@ pi install npm:@wolido/pi-lazy-tools
 lazy-tools/
 ├── README.md
 ├── lazy-tools.ts        # 扩展入口：配置读取、session_start、两个常驻工具
-└── lazy-tools/
-    └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
-└── test/                # 52 个测试（node:test + tsx）
+├── lazy-tools/
+│   └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
+└── test/                # 88 个测试（node:test + tsx）
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -52,7 +52,7 @@ lazy-tools/
 2. 启动命令的 `--tools` 白名单里保留 lazy 工具（注册与隐藏是两件事，详见[配置](#配置)）
 3. 开新会话生效（扩展在会话启动时加载，旧会话没有 `load_tools`）
 
-typebox：扩展直接 import typebox（pi 运行时同款）。若加载报找不到 typebox，按 lazy-tools-tests/README.md 的软链桥接处理。
+typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 node_modules）。
 
 ### 最小配置
 
@@ -73,20 +73,38 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 
 ### 使用示例
 
-对主智能体说：「激活 deploy_tool，把当前版本部署到 staging」。主智能体会自动执行两步：
+对主智能体说：「激活 deploy_tool，把当前版本部署到 staging」。整个流程分三步：
 
 1. `load_tools({ tools: ["deploy_tool"] })`
-   返回纯文本：description、参数 JSON Schema、guidelines
-2. `call_tool({ tool: "deploy_tool", params: { env: "staging" } })`
+   零副作用，只返回挑战文本、不激活任何工具。挑战文本列出将加载工具的名称与 description，声明本次调用未加载或激活任何工具，警告确认后这些工具将被激活（会话级）并可通过 call_tool 调用，并给出第二次调用的精确形状
+2. `load_tools({ tools: ["deploy_tool"], confirm: true })`
+   真正激活工具，返回使用说明：description、参数 JSON Schema、guidelines
+3. `call_tool({ tool: "deploy_tool", params: { env: "staging" } })`
    deploy_tool 真实执行，结果原样返回
 
-也可以不点工具名直接下达任务，主智能体会自行判断是否需要走懒加载流程。
+第二步必须建立在用户主动提出的加载要求之上：用户点名「激活 deploy_tool」就是明确要求。用户没有点名要求时，主智能体不能因为自行判断「任务需要某工具」就加载，而应先与用户确认。
 
 ## 使用
 
 ### load_tools：按需加载用法
 
-`load_tools` 不注册、不激活任何东西。它从 `getAllTools()`（注册后的运行时元数据，与 active 状态无关）取出目标工具的 description、参数 JSON Schema（格式化缩进）与 promptGuidelines，拼成一段 Markdown 文本，作为 tool_result 追加到消息流末尾。模型像读文档一样读到用法，不触碰 tools 字段和系统提示词。
+`load_tools` 带两步确认门：参数 `confirm` 为可选布尔，缺省视为 false。`confirm` 不为 true 的调用零副作用：不注册、不激活任何东西，只返回一段挑战文本（details 中 `confirmRequired: true`）：
+
+```
+加载确认：以下工具将在确认后被激活，并可通过 call_tool 调用。本次调用未加载或激活任何工具。
+
+注意：仅在用户主动要求时才加载工具；确认加载前请确认这是用户主动提出的要求。
+
+- deploy_tool: <description>
+
+确认加载请再次调用：load_tools({ tools: ["deploy_tool"], confirm: true })
+```
+
+挑战文本列出每个将被加载工具的名称与 description，声明本次调用未加载或激活任何工具，警告确认后这些工具将被激活（会话级）并可通过 call_tool 调用，最后给出第二次调用的精确形状。这条「仅响应用户主动要求」的约束也写进了 load_tools 自己的 promptGuidelines：`"Only load tools when the user explicitly asks for them; never load on your own initiative."`
+
+`confirm: true` 的第二次调用才真正把工具加入会话级激活集，并从 `getAllTools()`（注册后的运行时元数据，与 active 状态无关）取出目标工具的 description、参数 JSON Schema（格式化缩进）与 promptGuidelines，拼成一段 Markdown 文本，作为 tool_result 追加到消息流末尾。模型像读文档一样读到用法，不触碰 tools 字段和系统提示词。
+
+边界情况：空请求直接返回「没有请求任何工具。」；请求的工具全部不在 lazy 名单时直接返回拒绝结果。两种情况都不进入确认门，不出现 confirmRequired。
 
 白名单过滤：请求名单外的工具得到「拒绝（不在 lazy 名单中）」；名单内但未注册的工具得到「未找到工具元数据」（通常意味着 --tools 白名单缺了这个工具，见[坑 1](#1---tools-是严格注册白名单)）。
 
@@ -95,15 +113,15 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 四步闸门，任何一步失败都不触碰目标工具：
 
 1. 白名单校验：目标必须在 lazy-tools.json 名单中
-2. 激活门槛：必须先经过 `load_tools` 激活（激活状态是会话级记忆，会话开始清空）
+2. 激活门槛：必须先经过 `load_tools({ tools: [...], confirm: true })` 激活（激活状态是会话级记忆，会话开始清空）
 3. JSON Schema 预校验：支持 type / required / enum / pattern / properties / additionalProperties / items 子集；不合法时返回字段路径级错误（例：`role: expected one of [admin, member], got "foo"`），目标 execute 不执行
 4. 重放捕获 execute：用伪造的 pi（createFakePi）重放目标扩展的 factory，截获其 registerTool 注册的 ToolDefinition（含真实 execute），按 `${sourcePath}#${name}` memoize（每个工具每会话只重放一次 factory），随后以原始参数、signal、onUpdate、ctx 调用 `definition.execute`，结果原样返回
 
 ### 调用顺序
 
-- `call_tool` 要求目标工具先经过 `load_tools` 激活，未激活的调用直接拒绝并提示先加载
+- `call_tool` 要求目标工具先经过 `load_tools({ tools: [...], confirm: true })` 激活；未激活的调用直接拒绝，并提示先调用 `load_tools({ tools: ["<工具名>"], confirm: true })`
 - 激活状态是会话级记忆，会话开始清空
-- 两个常驻工具的 promptGuidelines 已把「先 load_tools 再 call_tool」的顺序写进系统提示词
+- 两个常驻工具的 promptGuidelines 写明「先 load_tools 再 call_tool」的调用顺序，load_tools 的 guidelines 另要求只在用户主动要求时才加载工具；「confirm: true」的确切调用形状由挑战文本与 call_tool 的未激活拒绝提示呈现
 
 ## 启动提示
 
@@ -169,8 +187,14 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 主智能体需要某个工具
         ▼
 load_tools({ tools: ["deploy_tool"] })
-  白名单过滤 → 从 getAllTools() 取 Description + 参数 JSON Schema + Guidelines
-  拼成纯文本 tool_result，追加到消息流末尾
+  白名单过滤 → 返回挑战文本（零副作用，confirmRequired: true）
+  列出目标工具名称与 description、警告激活后果、给出 confirm: true 调用形状
+        ▼
+用户确认（即用户主动提出的加载要求）
+        ▼
+load_tools({ tools: ["deploy_tool"], confirm: true })
+  确认门通过 → 工具加入会话级激活集
+  从 getAllTools() 取 Description + 参数 JSON Schema + Guidelines，拼成纯文本 tool_result
         │
 主智能体按用法组织参数
         ▼
@@ -182,7 +206,7 @@ call_tool({ tool: "deploy_tool", params: { env: "staging" } })
 四个设计要点：
 
 - session_start（首轮请求前）是唯一一次修改 tools 字段的动作，此后 tools 字段与系统提示词全程冻结
-- `load_tools` 把目标工具的 description、参数 Schema、guidelines 拼成纯文本 tool_result，追加在消息流末尾，模型像读文档一样读到用法
+- `load_tools` 首调只返回零副作用挑战文本，`confirm: true` 二次调用才把目标工具的 description、参数 Schema、guidelines 拼成纯文本 tool_result，追加在消息流末尾，模型像读文档一样读到用法
 - `call_tool` 经过四步闸门后，重放目标扩展 factory 捕获真实 execute，结果原样透传
 - 因此懒加载不造成任何一次缓存失效，任意模型、任意 provider 通用（论证见下）
 
@@ -274,7 +298,7 @@ createFakePi 用 `{ ...realPi }` 展开后黑名单打桩：只替换注册类�
 
 #### 适用范围
 
-lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具，注意力不再被低频定义占用。代价是每次使用多一轮 `load_tools` 往返和 `call_tool` 间接层。低频、参数简单的工具收益最大（远程代理、会话恢复类）；高频工具请移出名单回归常驻。
+lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具，注意力不再被低频定义占用。代价是每次使用都要先走 `load_tools` 的两步确认往返，再经 `call_tool` 间接调用。低频、参数简单的工具收益最大（远程代理、会话恢复类）；高频工具请移出名单回归常驻。
 
 #### 排障清单
 
@@ -286,12 +310,11 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 ### 参考
 
 - pi 官方文档 docs/extensions.md「Dynamic Tool Loading」章节：官方动态激活机制、原生 deferred 模型门槛、缓存提示
-- lazy-tools-tests/README.md：测试清单、软链桥接脚本、TDD 回归记录
 - pi-lazy-extensions（GitHub，实验性）：扩展级懒加载思路，本文决策记录对比对象
 
 ## 开发
 
-测试位于 `test/`，52 个用例（46 单元 + 6 集成）：
+测试位于 `test/`，88 个用例（68 单元 + 20 集成）：
 
 ```bash
 cd pi-lazy-tools
@@ -300,7 +323,7 @@ npm test            # node --import tsx --test test/core.test.ts test/integratio
 npm run typecheck   # tsc --noEmit（严格模式）
 ```
 
-覆盖：配置合并、白名单过滤、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、call_tool 全链路接线（未激活拒绝、参数错误不执行、factory memoize、events.on 打桩）。集成测试真实加载扩展源码，依赖目录外文件，需 node_modules 软链桥接，命令与桥接脚本见 lazy-tools-tests/README.md。
+覆盖：配置合并、白名单过滤、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、load_tools 两步确认门（挑战文本内容、confirm 缺省视为 false 不激活、confirm: true 激活、空请求与全拒绝不进确认门、用户主动要求约束）、call_tool 全链路接线（未激活拒绝、参数错误不执行、factory memoize、events.on 打桩）。集成测试真实加载扩展源码。
 
 ## License
 

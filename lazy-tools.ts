@@ -25,6 +25,7 @@ import {
 	validateParams,
 	canCall,
 	buildStartupNotice,
+	buildLoadChallenge,
 	type LazyConfig,
 } from "./lazy-tools/core.ts";
 
@@ -42,6 +43,7 @@ interface ConfigReadResult {
 	requested: string[];
 	accepted: string[];
 	rejected: string[];
+	confirmRequired?: boolean;
 }
 
 /**
@@ -139,6 +141,10 @@ const LoadToolsParams = Type.Object({
 	tools: Type.Array(Type.String(), {
 		description: "Names of lazy tools to load usage instructions for.",
 	}),
+	confirm: Type.Optional(Type.Boolean({
+		description:
+			'Set true to actually load the tools after reviewing the challenge returned by the first call. Default: false — the first call only returns a challenge (confirmRequired) and loads nothing.',
+	})),
 });
 
 type LoadToolsParams = Static<typeof LoadToolsParams>;
@@ -199,6 +205,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use load_tools when the task requires restoring or continuing a previous subagent session.",
 			"Use call_tool when you need to invoke a lazy tool that has already been loaded via load_tools.",
+			"Only load tools when the user explicitly asks for them; never load on your own initiative.",
 		],
 		parameters: LoadToolsParams,
 
@@ -206,6 +213,40 @@ export default function (pi: ExtensionAPI) {
 			const requested = [...new Set(params.tools)];
 			const { allowed: accepted, rejected } = filterAllowedTools(requested, lazyNames);
 
+			// a. 没有请求任何工具：保持原有行为，不进确认门。
+			if (requested.length === 0) {
+				const text = buildLoadResult(requested, accepted, rejected, pi);
+				return {
+					content: [{ type: "text", text }],
+					details: { requested, accepted, rejected } as ConfigReadResult,
+				};
+			}
+
+			// b. 请求的工具全部不在 lazy 名单：直接返回拒绝结果，不进确认门。
+			if (accepted.length === 0) {
+				const text = buildLoadResult(requested, accepted, rejected, pi);
+				return {
+					content: [{ type: "text", text }],
+					details: { requested, accepted, rejected } as ConfigReadResult,
+				};
+			}
+
+			// c. 有合法工具待加载但 confirm 不为 true：返回挑战文本，零副作用。
+			if (params.confirm !== true) {
+				const toolDescriptions: Record<string, string> = {};
+				for (const tool of pi.getAllTools()) {
+					if (typeof tool.name === "string" && typeof tool.description === "string") {
+						toolDescriptions[tool.name] = tool.description;
+					}
+				}
+				const text = buildLoadChallenge({ toolNames: accepted, toolDescriptions });
+				return {
+					content: [{ type: "text", text }],
+					details: { requested, accepted, rejected, confirmRequired: true } as ConfigReadResult,
+				};
+			}
+
+			// d. confirm === true：执行实际加载，将工具加入 activated 集合并返回使用说明。
 			for (const name of accepted) {
 				activated.add(name);
 			}

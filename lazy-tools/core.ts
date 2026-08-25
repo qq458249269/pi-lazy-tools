@@ -36,6 +36,11 @@ export interface StartupNoticeInput {
 	effectiveConfigPath: string | null;
 }
 
+export interface LoadChallengeInput {
+	toolNames: string[]; // 将被加载的工具名
+	toolDescriptions: Record<string, string>; // 工具名 → description（来自 getAllTools）
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -257,10 +262,39 @@ export function canCall(
 	if (!activatedSet.has(tool)) {
 		return {
 			ok: false,
-			reason: `工具 "${tool}" 尚未通过 load_tools 激活。请先调用 load_tools({ tools: ["${tool}"] })。`,
+			reason: `工具 "${tool}" 尚未通过 load_tools 激活。请先调用 load_tools({ tools: ["${tool}"], confirm: true })。`,
 		};
 	}
 	return { ok: true, reason: "" };
+}
+
+/**
+ * Build the two-step confirmation challenge text for load_tools.
+ *
+ * Lists each tool to be loaded with its description (or a fallback when
+ * metadata is missing), states that this call has no side effects, warns that
+ * the loaded tools will be activated and callable via call_tool, and spells out
+ * the exact second-call shape with confirm: true.
+ */
+export function buildLoadChallenge(input: LoadChallengeInput): string {
+	const lines: string[] = [];
+	lines.push(
+		"加载确认：以下工具将在确认后被激活，并可通过 call_tool 调用。本次调用未加载或激活任何工具。",
+	);
+	lines.push("");
+	lines.push("注意：仅在用户主动要求时才加载工具；确认加载前请确认这是用户主动提出的要求。");
+	lines.push("");
+
+	for (const name of input.toolNames) {
+		const description = input.toolDescriptions[name] ?? "未找到工具元数据";
+		lines.push(`- ${name}: ${description}`);
+	}
+
+	lines.push("");
+	const toolsList = input.toolNames.map((name) => JSON.stringify(name)).join(", ");
+	lines.push(`确认加载请再次调用：load_tools({ tools: [${toolsList}], confirm: true })`);
+
+	return lines.join("\n");
 }
 
 /**
