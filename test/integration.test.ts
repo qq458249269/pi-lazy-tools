@@ -26,6 +26,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -713,5 +714,177 @@ describe("lazy-tools startup notice (session_start)", () => {
 			0,
 			"a throwing notify must not surface as a handler failure warning",
 		);
+	});
+});
+// ===== 通用化注册文案（与任何本机具体工具名彻底解耦；TDD RED） =====
+//
+// 背景：load_tools 的注册期文案（description / promptSnippet / promptGuidelines[0]）
+// 曾写死本机工具名（revive_subagent、OpenAaaS）与专属能力语义（恢复 subagent 会话）。
+// 以下判据要求注册面与源码彻底通用化：
+//   T-A  从真实注册结果取三个文案字段，断言不含任何具体工具名字面量（可扩展黑名单 +
+//        动态“任何已注册工具名都不许出现”双保险），guideline 不得保留专指某工具的语义短语。
+//   T-B  源码兜底扫描：lazy-tools.ts / lazy-tools/core.ts 源文件本身不得残留这些字面量。
+//   T-C  性质断言（非逐字相等）：通用化后文案仍非空、有长度下限，且仍表达
+//        “先 load_tools 激活、再 call_tool 调用”的用法（两动作名必须同时出现）。
+
+describe("generic registration copy (decoupled from local tool names)", () => {
+	/**
+	 * 文案黑名单：注册期文案里禁止出现的具体工具名/本地耦合词（一律转小写后子串比对）。
+	 * 可扩展：未来发现任何新的写死名字，只需在此登记一条，T-A/T-B 的全部字段与源文件
+	 * 都会自动被检查到——不允许出现“只测当初那两个词”的一次性断言。
+	 */
+	const BANNED_COPY_LITERALS: string[] = ["revive_subagent", "openaas"];
+
+	/**
+	 * 语义黑名单：promptGuidelines 等面向模型的文案不得再专指某一类工具的特定能力。
+	 * （本次目标语义：restoring/continuing a previous subagent session = revive_subagent 专属。）
+	 */
+	const BANNED_SPECIFIC_PHRASES: string[] = ["subagent", "restore", "restoring", "continuing"];
+
+	/**
+	 * 参与扫描的运行时源文件（T-B 兜底：防止“运行时拼掉了、源码里还留着”的假解耦）。
+	 * lazy-tools/core.ts 当前 0 命中，一并纳入以覆盖未来把文案挪进 core 的情况。
+	 */
+	const RUNTIME_SOURCES: string[] = ["lazy-tools.ts", join("lazy-tools", "core.ts")];
+
+	const LOADER_NAME = "load_tools";
+	const CALLER_NAME = "call_tool";
+
+	interface LoadToolsCopy {
+		description: string;
+		promptSnippet: string;
+		promptGuidelines: string[];
+	}
+
+	/** 从真实注册结果取 load_tools 的三个文案字段（缺失或类型不符即失败）。 */
+	function getLoadToolsCopy(h: Harness): LoadToolsCopy {
+		const tool = h.getRegisteredTool(LOADER_NAME);
+		assert.ok(tool !== undefined, "load_tools should be registered");
+
+		const description = tool.description;
+		const promptSnippet = tool.promptSnippet;
+		const promptGuidelines = tool.promptGuidelines;
+		assert.equal(typeof description, "string", "load_tools.description should be a string");
+		assert.equal(typeof promptSnippet, "string", "load_tools.promptSnippet should be a string");
+		assert.ok(Array.isArray(promptGuidelines), "load_tools.promptGuidelines should be an array");
+		for (const g of promptGuidelines as unknown[]) {
+			assert.equal(typeof g, "string", "every promptGuideline should be a string");
+		}
+		return {
+			description: description as string,
+			promptSnippet: promptSnippet as string,
+			promptGuidelines: promptGuidelines as string[],
+		};
+	}
+
+	// T-A：注册面（description / promptSnippet / promptGuidelines）不得含黑名单字面量
+	it("should keep every banned tool-name literal out of description, promptSnippet, and promptGuidelines", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const copy = getLoadToolsCopy(h);
+			const fields: Record<string, string> = {
+				description: copy.description,
+				promptSnippet: copy.promptSnippet,
+				promptGuidelines: copy.promptGuidelines.join("\n"),
+			};
+
+			for (const [field, text] of Object.entries(fields)) {
+				const lowered = text.toLowerCase();
+				for (const banned of BANNED_COPY_LITERALS) {
+					assert.ok(
+						!lowered.includes(banned),
+						`load_tools.${field} must not contain the local tool name "${banned}" (upstream copy must be decoupled from any machine's toolset); got: ${text}`,
+					);
+				}
+			}
+		});
+	});
+
+	// T-A 动态版：任何在本 harness 中注册的工具名都不许出现在注册文案里
+	//（load_tools/call_tool 自身除外——文案本来就要教模型用这两个动作）。
+	it("should not mention the name of any registered tool other than load_tools and call_tool", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const copy = getLoadToolsCopy(h);
+			const all = [copy.description, copy.promptSnippet, ...copy.promptGuidelines]
+				.join("\n")
+				.toLowerCase();
+
+			const registeredNames = [LOADER_NAME, CALLER_NAME, FAKE_TOOL_NAME];
+			for (const name of registeredNames) {
+				if (name === LOADER_NAME || name === CALLER_NAME) continue;
+				assert.ok(
+					!all.includes(name.toLowerCase()),
+					`load_tools registration copy must not hardcode the local tool name "${name}"; got: ${all}`,
+				);
+			}
+		});
+	});
+
+	// T-A 语义版：guidelines 不得保留专指某一工具的特定能力短语（恢复/继续 subagent 会话）
+	it("should not keep capability-specific phrasing in promptGuidelines", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const copy = getLoadToolsCopy(h);
+			const text = copy.promptGuidelines.join("\n").toLowerCase();
+
+			for (const banned of BANNED_SPECIFIC_PHRASES) {
+				assert.ok(
+					!text.includes(banned),
+					`load_tools.promptGuidelines must not keep capability-specific phrasing "${banned}" (was specialized for revive_subagent's session-restore semantics); got: ${text}`,
+				);
+			}
+		});
+	});
+
+	// T-B：源码兜底扫描（防止运行时拼掉、源码残留）
+	it("should not contain any banned tool-name literal in the runtime source files", () => {
+		for (const rel of RUNTIME_SOURCES) {
+			const src = readFileSync(join(import.meta.dirname, "..", rel), "utf8").toLowerCase();
+			for (const banned of BANNED_COPY_LITERALS) {
+				assert.ok(
+					!src.includes(banned),
+					`${rel} source must not contain the local tool name "${banned}" (copy must be generic at the source level, not assembled away at runtime);`,
+				);
+			}
+		}
+	});
+
+	// T-C：description 仍表达“先 load_tools、再 call_tool”的用法（非逐字相等，只锁性质）
+	it("should keep description non-trivial and mention both the load and call actions in order", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const { description } = getLoadToolsCopy(h);
+
+			assert.ok(description.trim().length >= 20, `description must stay substantive (>= 20 chars), not an empty or stub string; got: ${JSON.stringify(description)}`);
+			assert.ok(description.includes(LOADER_NAME), `description must still teach the load action ("${LOADER_NAME}"); got: ${description}`);
+			assert.ok(description.includes(CALLER_NAME), `description must still teach the call action ("${CALLER_NAME}"); got: ${description}`);
+			assert.ok(
+				description.indexOf(LOADER_NAME) < description.indexOf(CALLER_NAME),
+				`description must present the load action before the call action (load-then-call usage); got: ${description}`,
+			);
+		});
+	});
+
+	// T-C：promptSnippet 仍同时表达 load 与 call 两个动作名（不得退化成空串/单字/只提一边）
+	it("should keep promptSnippet non-trivial and mention both the load and call actions", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const { promptSnippet } = getLoadToolsCopy(h);
+
+			assert.ok(promptSnippet.trim().length >= 30, `promptSnippet must stay substantive (>= 30 chars); got: ${JSON.stringify(promptSnippet)}`);
+			assert.match(promptSnippet, /load/i, `promptSnippet must mention the load action; got: ${promptSnippet}`);
+			assert.match(promptSnippet, /call/i, `promptSnippet must mention the call action; got: ${promptSnippet}`);
+		});
+	});
+
+	// T-C：promptGuidelines 仍覆盖 load 与 call 两个动作名，且每条都不退化
+	it("should keep promptGuidelines non-trivial and cover both the load and call actions", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const { promptGuidelines } = getLoadToolsCopy(h);
+
+			assert.ok(promptGuidelines.length > 0, "promptGuidelines must not become an empty array");
+			const joined = promptGuidelines.join("\n");
+			for (const g of promptGuidelines) {
+				assert.ok(g.trim().length >= 10, `every guideline must stay substantive (>= 10 chars), not an empty or stub string; got: ${JSON.stringify(g)}`);
+			}
+			assert.ok(joined.includes(LOADER_NAME), `promptGuidelines must still cover the load action ("${LOADER_NAME}"); got: ${joined}`);
+			assert.ok(joined.includes(CALLER_NAME), `promptGuidelines must still cover the call action ("${CALLER_NAME}"); got: ${joined}`);
+		});
 	});
 });

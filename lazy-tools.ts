@@ -200,10 +200,10 @@ export default function (pi: ExtensionAPI) {
 		name: LOADER_NAME,
 		label: "Load Tools",
 		description:
-			"当任务需要恢复/继续之前的 subagent 会话（revive_subagent），或需要向远程 OpenAaaS Agent 服务提交任务（OpenAaaS）时，先用 load_tools 获取其用法，再用 call_tool 调用。",
-		promptSnippet: "Activate hidden tools such as revive_subagent or OpenAaaS by loading their usage instructions.",
+			"当任务需要用到某个未激活的 lazy 工具时，先用 load_tools 获取其用法，再用 call_tool 调用。",
+		promptSnippet: "Load a lazy tool's usage instructions with load_tools, then invoke it with call_tool.",
 		promptGuidelines: [
-			"Use load_tools when the task requires restoring or continuing a previous subagent session.",
+			"Use load_tools when the task requires a lazy tool that is not currently active.",
 			"Use call_tool when you need to invoke a lazy tool that has already been loaded via load_tools.",
 			"Only load tools when the user explicitly asks for them; never load on your own initiative.",
 		],
