@@ -143,7 +143,7 @@ const LoadToolsParams = Type.Object({
 	}),
 	confirm: Type.Optional(Type.Boolean({
 		description:
-			'Set true to actually load the tools after reviewing the challenge returned by the first call. Default: false — the first call only returns a challenge (confirmRequired) and loads nothing.',
+			'Set true to actually load the tools after reviewing the challenge returned by the first call. Default: false; the first call only returns a challenge (confirmRequired) and loads nothing.',
 	})),
 });
 
