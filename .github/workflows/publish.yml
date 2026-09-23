@@ -1,10 +1,10 @@
-# 自动打包发布：push 到 main（或手动触发）→ 校验 → 计算当日版本 → npm 发布 + GitHub Release。
+# 自动打包发布：push 到 main（或手动触发）→ 校验 → 计算当日版本 → 打 tag + GitHub Release（附 npm pack 包）。
+# 不发布 npm registry。
 #
 # 版本号：git tag 用 vYYYYMMDD.NNNN（当日 NNNN 从 0001 递增，扫已有 tag 取 max+1）；
-# npm 只接受合法 semver（"20260923.0001" 会被拒为 Invalid version），
-# 故 npm 版本用 YYYYMMDD.0.N（N 与 tag 序号一致）。
+# 包内 version 用 YYYYMMDD.0.N（仅影响 tgz 文件名，N 与 tag 序号一致）。
 #
-# 需要仓库 secret：NPM_TOKEN。tag 已存在则跳过发布（幂等）。
+# tag 已存在则跳过（幂等）。
 
 name: Publish
 
@@ -32,7 +32,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
 
       - run: npm ci
       - run: npm run typecheck
@@ -58,11 +57,6 @@ jobs:
 
       - if: steps.exists.outputs.skip == 'false'
         run: npm version --no-git-tag-version "${{ steps.ver.outputs.npm }}"
-
-      - if: steps.exists.outputs.skip == 'false'
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - if: steps.exists.outputs.skip == 'false'
         run: |
