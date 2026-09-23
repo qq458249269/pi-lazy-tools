@@ -1,0 +1,78 @@
+# 自动打包发布：push 到 main（或手动触发）→ 校验 → 计算当日版本 → npm 发布 + GitHub Release。
+#
+# 版本号：git tag 用 vYYYYMMDD.NNNN（当日 NNNN 从 0001 递增，扫已有 tag 取 max+1）；
+# npm 只接受合法 semver（"20260923.0001" 会被拒为 Invalid version），
+# 故 npm 版本用 YYYYMMDD.0.N（N 与 tag 序号一致）。
+#
+# 需要仓库 secret：NPM_TOKEN。tag 已存在则跳过发布（幂等）。
+
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lazy-tools.ts"
+      - "lazy-tools/**"
+      - "package.json"
+      - ".github/workflows/publish.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要全部 tag 以计算当日序号
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Compute version
+        id: ver
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          MAX=$(git tag -l "v${DATE}.*" | sed -E "s/^v${DATE}\.//" | grep -E '^[0-9]+$' | sort -n | tail -1)
+          NEXT=$((${MAX:-0} + 1))
+          printf 'tag=v%s.%04d\n' "$DATE" "$NEXT" >> "$GITHUB_OUTPUT"
+          printf 'npm=%s.0.%d\n' "$DATE" "$NEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing tag
+        id: exists
+        run: |
+          if git rev-parse -q --verify "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.exists.outputs.skip == 'false'
+        run: npm version --no-git-tag-version "${{ steps.ver.outputs.npm }}"
+
+      - if: steps.exists.outputs.skip == 'false'
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - if: steps.exists.outputs.skip == 'false'
+        run: |
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - if: steps.exists.outputs.skip == 'false'
+        run: npm pack
+
+      - if: steps.exists.outputs.skip == 'false'
+        run: gh release create "${{ steps.ver.outputs.tag }}" ./*.tgz --title "${{ steps.ver.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

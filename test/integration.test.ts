@@ -70,6 +70,11 @@ type SessionHandler = (
 	ctx: { cwd?: string; ui?: { notify?: (text: string, options?: unknown) => void } },
 ) => void | Promise<void>;
 
+/** before_agent_start handler 的最小形态（扩展只消费 systemPrompt / systemPromptOptions.skills）。 */
+type BeforeAgentStartHandler = (
+	event: { systemPrompt: string; systemPromptOptions: { skills?: unknown[] } },
+) => { systemPrompt?: string } | void;
+
 /** boot() 构造 session ctx/event 的选项（覆盖通知缺失/抛错、reason、配置文件缺失分支）。 */
 interface BootOptions {
 	/** 是否提供 ctx.ui（默认 true；false 模拟 ctx 完全没有 ui）。 */
@@ -108,6 +113,10 @@ interface Harness {
 	getUserHomePath(): string | undefined;
 	/** 返回已注册工具中指定名的工具定义（未注册则返回 undefined）。 */
 	getRegisteredTool(name: string): Record<string, unknown> | undefined;
+	/** 触发已注册的 before_agent_start handler，返回回传的 systemPrompt（若无则 undefined）。 */
+	fireBeforeAgentStart(systemPromptOptions: unknown, systemPrompt?: string): { systemPrompt?: string } | undefined;
+	/** 最近一次 pi.setActiveTools 收到的工具集。 */
+	getLastActiveTools(): string[] | undefined;
 }
 
 function globalCounter(key: string): number {
@@ -142,8 +151,10 @@ function createHarness(): Harness {
 	const registered: Array<Record<string, unknown>> = [];
 	const fakeEventCalls: string[] = [];
 	const sessionHandlers: SessionHandler[] = [];
+	const beforeAgentStartHandlers: BeforeAgentStartHandler[] = [];
 	const notifyCalls: Array<{ text: string; options?: unknown }> = [];
 	let setActiveToolsCalls = 0;
+	let lastActiveTools: string[] | undefined;
 	let workspace: string | undefined;
 	let userHome: string | undefined;
 
@@ -161,8 +172,9 @@ function createHarness(): Harness {
 		registerEntryRenderer: () => {},
 		registerProvider: () => {},
 		unregisterProvider: () => {},
-		setActiveTools: () => {
+		setActiveTools: (names: string[]) => {
 			setActiveToolsCalls += 1;
+			lastActiveTools = names;
 		},
 		getActiveTools: (): string[] => [],
 		getAllTools: () => [
@@ -182,8 +194,9 @@ function createHarness(): Harness {
 				sourceInfo: { path: FIXTURE_SOURCE },
 			},
 		],
-		on: (event: string, handler: SessionHandler) => {
-			if (event === "session_start") sessionHandlers.push(handler);
+		on: (event: string, handler: SessionHandler | BeforeAgentStartHandler) => {
+			if (event === "session_start") sessionHandlers.push(handler as SessionHandler);
+			else if (event === "before_agent_start") beforeAgentStartHandlers.push(handler as BeforeAgentStartHandler);
 		},
 		events: {
 			on: (event: string) => {
@@ -206,6 +219,7 @@ function createHarness(): Harness {
 			resetGlobalCounters();
 			notifyCalls.length = 0;
 			setActiveToolsCalls = 0;
+			lastActiveTools = undefined;
 			userHome = undefined;
 			workspace = mkdtempSync(join(tmpdir(), "lazy-tools-it-"));
 			mkdirSync(join(workspace, ".pi"));
@@ -296,6 +310,24 @@ function createHarness(): Harness {
 		},
 		getRegisteredTool(name: string): Record<string, unknown> | undefined {
 			return registered.find((t) => t.name === name);
+		},
+		fireBeforeAgentStart(systemPromptOptions: unknown, systemPrompt = ""): { systemPrompt?: string } | undefined {
+			let current = systemPrompt;
+			let returned: { systemPrompt?: string } | undefined;
+			for (const handler of beforeAgentStartHandlers) {
+				const result = handler({
+					systemPrompt: current,
+					systemPromptOptions: systemPromptOptions as { skills?: unknown[] },
+				});
+				if (result && typeof result === "object" && result.systemPrompt !== undefined) {
+					current = result.systemPrompt;
+					returned = { systemPrompt: current };
+				}
+			}
+			return returned;
+		},
+		getLastActiveTools(): string[] | undefined {
+			return lastActiveTools;
 		},
 	};
 }
@@ -885,6 +917,64 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 			}
 			assert.ok(joined.includes(LOADER_NAME), `promptGuidelines must still cover the load action ("${LOADER_NAME}"); got: ${joined}`);
 			assert.ok(joined.includes(CALLER_NAME), `promptGuidelines must still cover the call action ("${CALLER_NAME}"); got: ${joined}`);
+		});
+	});
+});
+
+// lazy-skills：技能清单从系统提示剥离，改以 skill_search 检索
+//（pi 0.84.x 无 sections → 扩展回传重写后的整串 systemPrompt）
+describe("lazy-skills", () => {
+	it("should strip the skills prompt section and search skills via skill_search", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const search = h.getRegisteredTool("skill_search");
+			assert.ok(search !== undefined, "skill_search should be registered");
+
+			const basePrompt = [
+				"You are a test.",
+				"",
+				"The following skills provide specialized instructions for specific tasks.",
+				"Use the read tool to load a skill's file when the task matches its description.",
+				"",
+				"<available_skills>",
+				"  <skill>",
+				"    <name>foo-skill</name>",
+				"  </skill>",
+				"</available_skills>",
+				"",
+				"Current working directory: /w",
+			].join("\n");
+
+			// 无技能 → 不重写提示词
+			assert.equal(
+				h.fireBeforeAgentStart({ skills: [] }, basePrompt),
+				undefined,
+				"empty skills should not trigger a prompt rewrite",
+			);
+
+			const skills = [
+				{ name: "foo-skill", description: "Foo helpers", filePath: "/skills/foo/SKILL.md" },
+			];
+			const result = h.fireBeforeAgentStart({ skills }, basePrompt);
+			assert.ok(result?.systemPrompt, "handler should return a replacement system prompt");
+			const replaced = result.systemPrompt!;
+			assert.ok(!replaced.includes("<available_skills>"), `skills section should be stripped; got: ${replaced}`);
+			assert.ok(replaced.includes("skill_search"), `note should point at skill_search; got: ${replaced}`);
+			assert.ok(replaced.includes("You are a test."), "base prompt must be preserved");
+
+			const active = h.getLastActiveTools();
+			assert.ok(active?.includes("skill_search"), `skill_search should be in the initial active set; got: ${JSON.stringify(active)}`);
+
+			const execute = search!.execute as (
+				id: string,
+				params: { query: string },
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+			const hit = await execute("", { query: "foo" });
+			const hitText = hit.content.map((c) => c.text).join("\n");
+			assert.ok(hitText.includes("foo-skill"), `search should find foo-skill; got: ${hitText}`);
+			assert.ok(hitText.includes("SKILL.md"), `search should return the SKILL.md path; got: ${hitText}`);
+
+			const miss = await execute("", { query: "zzz-not-there" });
+			assert.ok(miss.content[0]!.text.length > 0, "empty search should still return text");
 		});
 	});
 });

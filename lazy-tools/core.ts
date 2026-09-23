@@ -262,7 +262,7 @@ export function canCall(
 	if (!activatedSet.has(tool)) {
 		return {
 			ok: false,
-			reason: `工具 "${tool}" 尚未通过 load_tools 激活。请先调用 load_tools({ tools: ["${tool}"], confirm: true })。`,
+			reason: `工具 "${tool}" 未激活；先 load_tools({ tools: ["${tool}"], confirm: true })。`,
 		};
 	}
 	return { ok: true, reason: "" };
@@ -278,11 +278,9 @@ export function canCall(
  */
 export function buildLoadChallenge(input: LoadChallengeInput): string {
 	const lines: string[] = [];
-	lines.push(
-		"加载确认：以下工具将在确认后被激活，并可通过 call_tool 调用。本次调用未加载或激活任何工具。",
-	);
+	lines.push("以下工具确认后将激活，可经 call_tool 调用；本次未加载或激活任何工具。");
 	lines.push("");
-	lines.push("注意：仅在用户主动要求时才加载工具；确认加载前请确认这是用户主动提出的要求。");
+	lines.push("唯用户主动要求方加载，确认前请核对。");
 	lines.push("");
 
 	for (const name of input.toolNames) {
@@ -292,7 +290,7 @@ export function buildLoadChallenge(input: LoadChallengeInput): string {
 
 	lines.push("");
 	const toolsList = input.toolNames.map((name) => JSON.stringify(name)).join(", ");
-	lines.push(`确认加载请再次调用：load_tools({ tools: [${toolsList}], confirm: true })`);
+	lines.push(`确认请再调：load_tools({ tools: [${toolsList}], confirm: true })`);
 
 	return lines.join("\n");
 }

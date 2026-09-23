@@ -33,11 +33,21 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const requireFn = createJiti(import.meta.url);
+const jiti = createJiti(import.meta.url);
 
 const CONFIG_NAME = "lazy-tools.json";
 const LOADER_NAME = "load_tools";
 const CALLER_NAME = "call_tool";
+const SKILL_SEARCH_NAME = "skill_search";
+
+interface SkillMeta {
+	name: string;
+	description: string;
+	filePath: string;
+}
+
+/** 技不内联于系统提示，改由 skill_search 检索。 */
+const SKILLS_NOTE = "技能清单不列于此。唯用户明请用技时，调 skill_search 检索，再读所返 SKILL.md。";
 
 interface ConfigReadResult {
 	requested: string[];
@@ -113,7 +123,8 @@ async function findToolDefinition(sourcePath: string, name: string, realPi: Exte
 	if (cached) return cached;
 
 	try {
-		const factory = await requireFn.import(sourcePath.replaceAll("\\", "/"), { default: true });
+		const mod = await jiti.import<{ default?: unknown }>(sourcePath.replaceAll("\\", "/"), { default: true });
+		const factory = mod?.default ?? mod;
 		if (typeof factory !== "function") {
 			return undefined;
 		}
@@ -138,20 +149,19 @@ async function findToolDefinition(sourcePath: string, name: string, realPi: Exte
 
 const LoadToolsParams = Type.Object({
 	tools: Type.Array(Type.String(), {
-		description: "Names of lazy tools to load usage instructions for.",
+		description: "待载入之 lazy 工具名。",
 	}),
 	confirm: Type.Optional(Type.Boolean({
-		description:
-			'Set true to actually load the tools after reviewing the challenge returned by the first call. Default: false; the first call only returns a challenge (confirmRequired) and loads nothing.',
+		description: "true 方载入；缺省只返挑战，不载入。",
 	})),
 });
 
 type LoadToolsParams = Static<typeof LoadToolsParams>;
 
 const CallToolParams = Type.Object({
-	tool: Type.String({ description: "Name of the lazy tool to invoke." }),
+	tool: Type.String({ description: "目标 lazy 工具名。" }),
 	params: Type.Record(Type.String(), Type.Unknown(), {
-		description: "Parameters to forward to the target tool.",
+		description: "透传目标工具之参数。",
 	}),
 });
 
@@ -194,17 +204,17 @@ export default function (pi: ExtensionAPI) {
 	let lazyNames: string[] = [];
 	let lazySet = new Set<string>();
 	const activated = new Set<string>();
+	let skills: SkillMeta[] = [];
 
 	pi.registerTool({
 		name: LOADER_NAME,
 		label: "Load Tools",
-		description:
-			"当任务需要用到某个未激活的 lazy 工具时，先用 load_tools 获取其用法，再用 call_tool 调用。",
-		promptSnippet: "Load a lazy tool's usage instructions with load_tools, then invoke it with call_tool.",
+		description: "lazy 工具先经 load_tools 取用法，再由 call_tool 调用。",
+		promptSnippet: "先 load_tools 取用法，后 call_tool 调用之。",
 		promptGuidelines: [
-			"Use load_tools when the task requires a lazy tool that is not currently active.",
-			"Use call_tool when you need to invoke a lazy tool that has already been loaded via load_tools.",
-			"Only load tools when the user explicitly asks for them; never load on your own initiative.",
+			"未激活者先 load_tools 取用法。",
+			"已激活者以 call_tool 调用。",
+			"唯用户主动要求方可 load_tools，勿自发。",
 		],
 		parameters: LoadToolsParams,
 
@@ -261,12 +271,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: CALLER_NAME,
 		label: "Call Tool",
-		description:
-			"调用已经由 load_tools 激活的隐藏工具。参数 tool 指定目标工具名，params 透传给目标工具。",
-		promptSnippet: "Invoke a lazy tool that has already been loaded via load_tools.",
-		promptGuidelines: [
-			"Use call_tool only after the target tool has been loaded via load_tools.",
-		],
+		description: "以 call_tool 调用已激活之 lazy 工具，params 透传其参。",
+		promptSnippet: "仅可调已由 load_tools 激活之 lazy 工具。",
+		promptGuidelines: ["先经 load_tools 激活，后以 call_tool 调用。"],
 		parameters: CallToolParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -304,6 +311,39 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: SKILL_SEARCH_NAME,
+		label: "Search Skills",
+		description: "以关键词或技名寻技，返名、述、SKILL.md 路径。",
+		promptSnippet: "寻技能，返 SKILL.md 路径。",
+		parameters: Type.Object({
+			query: Type.String({ description: "检索之词或技名。" }),
+		}),
+
+		async execute(_toolCallId, params) {
+			const query = params.query.toLowerCase();
+			const hits = skills.filter(
+				(s) => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query),
+			);
+			const text =
+				hits.length === 0
+					? "未找到匹配之技能。"
+					: hits.map((s) => `- ${s.name}: ${s.description}（SKILL.md: ${s.filePath}）`).join("\n");
+			return { content: [{ type: "text", text }], details: {} };
+		},
+	});
+
+	// pi 0.84.x 无 sections 字段：须回传整串 systemPrompt 方能生效（每轮均触发）。
+	pi.on("before_agent_start", (event) => {
+		skills = event.systemPromptOptions.skills ?? [];
+		if (skills.length === 0) return;
+		const stripped = event.systemPrompt.replace(
+			/\n\nThe following skills provide specialized instructions[\s\S]*?<\/available_skills>/,
+			"",
+		);
+		return { systemPrompt: `${stripped}\n\n${SKILLS_NOTE}` };
+	});
+
 	pi.on("session_start", async (event, ctx) => {
 		try {
 			const cwd = ctx.cwd ?? process.cwd();
@@ -331,7 +371,7 @@ export default function (pi: ExtensionAPI) {
 
 			const active = pi.getActiveTools();
 			const filtered = active.filter((toolName) => !lazySet.has(toolName));
-			const initial = [...new Set([...filtered, LOADER_NAME, CALLER_NAME])];
+			const initial = [...new Set([...filtered, LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME])];
 			pi.setActiveTools(initial);
 
 			if (event?.reason === "startup") {
