@@ -6,12 +6,12 @@
  */
 
 export interface LazyConfig {
-	lazy?: unknown;
+	resident?: unknown;
 	[key: string]: unknown;
 }
 
 export interface LazyList {
-	lazy: string[];
+	resident: string[];
 }
 
 export interface FilterResult {
@@ -51,12 +51,12 @@ function extractStringArray(value: unknown): string[] | undefined {
 }
 
 /**
- * Merge user-level and project-level lazy tool configs.
+ * Merge user-level and project-level resident (non-lazy) exception configs.
  *
- * - If projectCfg is non-null and contains a `lazy` array, it fully replaces
+ * - If projectCfg is non-null and contains a `resident` array, it fully replaces
  *   the user config.
  * - Otherwise fall back to userCfg.
- * - Non-array `lazy` fields are treated as absent.
+ * - Non-array `resident` fields are treated as absent.
  * - Non-string entries in the array are filtered out.
  */
 export function mergeLazyConfigs(
@@ -65,13 +65,13 @@ export function mergeLazyConfigs(
 ): LazyList {
 	for (const cfg of [projectCfg, userCfg]) {
 		if (isObject(cfg)) {
-			const lazy = extractStringArray(cfg.lazy);
-			if (lazy !== undefined) {
-				return { lazy };
+			const resident = extractStringArray(cfg.resident);
+			if (resident !== undefined) {
+				return { resident };
 			}
 		}
 	}
-	return { lazy: [] };
+	return { resident: [] };
 }
 
 /**
@@ -220,17 +220,17 @@ export function validateParams(schema: unknown, params: unknown): ValidationResu
 	return { ok: errors.length === 0, errors };
 }
 
-function hasValidLazyArray(cfg: LazyConfig | null): boolean {
-	return isObject(cfg) && Array.isArray(cfg.lazy);
+function hasValidResidentArray(cfg: LazyConfig | null): boolean {
+	return isObject(cfg) && Array.isArray(cfg.resident);
 }
 
 /**
  * Select which config path is currently effective.
  *
- * - If the project config contains a valid `lazy` array (empty array counts),
+ * - If the project config contains a valid `resident` array (empty array counts),
  *   the project path wins.
- * - Otherwise fall back to the user config if it contains a valid `lazy` array.
- * - If neither config has a valid `lazy` array, return null.
+ * - Otherwise fall back to the user config if it contains a valid `resident` array.
+ * - If neither config has a valid `resident` array, return null.
  *
  * Non-string entries inside the array do not affect the array's validity.
  */
@@ -240,8 +240,8 @@ export function selectEffectiveConfigPath(
 	userPath: string,
 	projectPath: string,
 ): string | null {
-	if (hasValidLazyArray(projectCfg)) return projectPath;
-	if (hasValidLazyArray(userCfg)) return userPath;
+	if (hasValidResidentArray(projectCfg)) return projectPath;
+	if (hasValidResidentArray(userCfg)) return userPath;
 	return null;
 }
 

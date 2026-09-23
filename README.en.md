@@ -8,7 +8,7 @@ Let low-frequency tools load on demand, the way Skills do, inside pi.
 
 The tools the main agent can call, and the multi-kilobyte manuals attached to each of them, largely decide what it can do. Those manuals appear in full on every request, including the ones used in maybe 5% of sessions: the agent has to re-read all of them every round to find what the current task actually needs. We worked out this "clean context" philosophy at the subagent level with [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation), where the main agent only assigns work and never touches task details. The tool dimension has the same problem left: low-frequency definitions are present every round.
 
-Skills solve the same problem with progressive disclosure: load only what is needed. pi-lazy-tools applies that idea to tools. Registration stays as-is (the `--tools` whitelist and pi runtime metadata are untouched); at session start the listed tools are removed from the LLM-visible active set, granular to individual tools, so a single extension can be partially hidden. When one is needed, `load_tools` injects its usage instructions as plain text and `call_tool` executes on its behalf; the actual execution is always the target extension's own `execute`. After the removal, the context holds only the tools the agent actually uses; attention stops being spent on low-frequency manuals. Because the tools field and the system prompt never change during a session, lazy loading never invalidates the cache, on any model (argument in [How it works](#how-it-works)).
+Skills solve the same problem with progressive disclosure: load only what is needed. pi-lazy-tools applies that idea to tools. Registration stays as-is (the `--tools` whitelist and pi runtime metadata are untouched); at session start every non-resident tool (all installed tools by default) is removed from the LLM-visible active set, granular to individual tools, so a single extension can be partially hidden. When one is needed, `load_tools` injects its usage instructions as plain text and `call_tool` executes on its behalf; the actual execution is always the target extension's own `execute`. After the removal, the context holds only the tools the agent actually uses; attention stops being spent on low-frequency manuals. Because the tools field and the system prompt never change during a session, lazy loading never invalidates the cache, on any model (argument in [How it works](#how-it-works)).
 
 ## Table of contents
 
@@ -56,22 +56,24 @@ typebox: the extension imports typebox directly (the same one pi uses; it lives 
 
 ### Minimal config
 
-With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the resident `load_tools`, `call_tool`, `skill_search`; the skills roster stays out of the system prompt too and is reachable only via `skill_search`. Writing a `lazy` array switches to explicit-list mode, and `"lazy": []` keeps everything resident.
+With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the resident `load_tools`, `call_tool`, `skill_search`; the skills roster stays out of the system prompt too and is reachable only via `skill_search`. The config's `resident` array lists the exceptions (tools that stay always-on); `"resident": []` means no exceptions — everything is lazy.
 
 ```jsonc
 // ~/.pi/lazy-tools.json
 {
-  "lazy": ["deploy_tool"]
+  "resident": ["read", "bash"]
 }
 ```
 
-deploy_tool is an example tool name; replace it with your own low-frequency tool (criteria in [Picking tools to lazy-load](#picking-tools-to-lazy-load)).
+List the tools that stay always-on and out of the lazy set (e.g. `read`, `bash`); everything else loads on demand. Inverted picking criteria in [Picking tools to lazy-load](#picking-tools-to-lazy-load).
 
 Putting the file at `<cwd>/.pi/lazy-tools.json` scopes it to the current project and overrides the user-level list entirely (merge rules in [Configuration](#configuration)).
 
 ### Picking tools to lazy-load
 
-Go through the tools registered in pi's tool list: anything with a long description and a sizeable parameter schema, yet used once every few days, is a candidate. Two criteria: low frequency (days between uses) and simple parameters (one or two fields per call). Do not lazy-load hot tools; the extra `load_tools` round-trip per use is a net loss.
+Everything is lazy by default, so the criteria below invert: keep the `resident` exceptions to hot, must-have tools — every other use would otherwise cost an extra `load_tools` round-trip.
+
+Go through the tools registered in pi's tool list: anything with a long description and a sizeable parameter schema, yet used once every few days, is a candidate. Two criteria: low frequency (days between uses) and simple parameters (one or two fields per call). Keep hot tools out of the lazy set (put them in `resident`); the extra `load_tools` round-trip per use is a net loss.
 
 ### Usage example
 
@@ -139,11 +141,15 @@ Config file in effect:
 ~/.pi/lazy-tools.json
 ```
 
-Which config wins follows the [Configuration](#configuration) merge rules: the project config when it has a `lazy` array, otherwise the user config. When neither location has a config with a `lazy` array, the notice lists both candidate paths and states that neither exists; the list is then necessarily empty, because it comes from the config files:
+Which config wins follows the [Configuration](#configuration) merge rules: the project config when it has a `resident` array, otherwise the user config. When neither location has a config with a `resident` array, the notice lists both candidate paths and states that neither exists; the default then takes over — every non-resident tool is lazy, so the notice lists them all:
 
 ```
 Current lazy tool list:
-(empty)
+- read
+- bash
+- edit
+- write
+- … (all lazy tools)
 
 No config file present:
 user-level: ~/.pi/lazy-tools.json
@@ -163,19 +169,19 @@ Two levels; the project config overrides the user config entirely:
 | User | `~/.pi/lazy-tools.json` | default list for all projects |
 | Project | `<cwd>/.pi/lazy-tools.json` | .pi dir under the session cwd; overrides user |
 
-Format: `{ "lazy": string[] }`, e.g. `{ "lazy": ["deploy_tool"] }`
+Format: `{ "resident": string[] }`, e.g. `{ "resident": ["read", "bash"] }`
 
 Merge rules:
 
 | Project config | User config | Effective list |
 | --- | --- | --- |
-| Has a `lazy` array | Anything | Project (full replacement; an empty array also wins) |
-| Missing or corrupt | Has a `lazy` array | User |
+| Has a `resident` array | Anything | Project (full replacement; an empty array also wins) |
+| Missing or corrupt | Has a `resident` array | User |
 | Missing or corrupt | Missing or corrupt | Lazy everything by default (only the resident trio stays active) |
 
 Reading: a JSON parse failure logs a warning and is treated as missing; non-string entries in the array are filtered out. Config is read at session_start; edits mid-session take effect only after starting a new session.
 
-**Note: the --tools whitelist must keep lazy tools listed.** Registration and hiding are two separate things: --tools registers, the extension hides. Listing a tool in lazy-tools.json only, without --tools, makes `load_tools` return "tool metadata not found". Adding a lazy tool means updating both places (see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
+**Note: the --tools whitelist must register every tool you want to lazy-load.** Registration and hiding are two separate things: --tools registers, the extension hides. A tool missing from --tools never reaches `getAllTools()`, so `load_tools` returns "tool metadata not found"; `resident` only decides who stays always-on and does not replace registration (see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
 
 ## How it works
 
@@ -183,7 +189,7 @@ The full lazy-load call chain:
 
 ```
 Session start (session_start, before the first request)
-  read both config levels → remove listed tools from the active set → ensure load_tools / call_tool
+  read both config levels → remove all non-resident tools from the active set → ensure load_tools / call_tool
   tools field frozen afterwards; system prompt never changes
         │
 main agent needs a tool
@@ -263,7 +269,7 @@ promptGuidelines enter the system prompt only while a tool is active. Tools here
 
 #### 1. --tools is a strict registration whitelist
 
-Tools outside `--tools` are not even visible to `getAllTools()`, surfacing as "tool metadata not found" from `load_tools`. pi-lazy-tools only hides visibility; registration must come from --tools. Lesson: adding a lazy tool means updating two places, `lazy-tools.json` and the launch command's `--tools`; neither one alone is enough.
+Tools outside `--tools` are not even visible to `getAllTools()`, surfacing as "tool metadata not found" from `load_tools`. pi-lazy-tools only hides visibility; registration must come from --tools. Lesson: `--tools` owns registration; the config's `resident` array owns who stays out of the lazy set — different jobs, one does not replace the other.
 
 #### 2. Extensions load at session start
 
@@ -300,7 +306,7 @@ The replay load and pi's extension load must resolve to the same module instance
 
 #### When lazy-loading pays off
 
-Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of a two-step `load_tools` confirmation round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools out of the list.
+Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of a two-step `load_tools` confirmation round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools in `resident`.
 
 #### Troubleshooting
 
@@ -316,7 +322,7 @@ Lazy-loading keeps low-frequency definitions out of the main agent's context, at
 
 ## Development
 
-Tests live in `test/`, 88 cases (68 unit + 20 integration):
+Tests live in `test/`, 97 cases (68 unit + 29 integration):
 
 ```bash
 cd pi-lazy-tools

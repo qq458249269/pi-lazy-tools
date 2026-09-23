@@ -9,7 +9,7 @@
  *
  *   User:    ~/.pi/lazy-tools.json
  *   Project: <cwd>/.pi/lazy-tools.json
- *   Format:  { "lazy": string[] }
+ *   Format:  { "resident": string[] }   # 不 lazy（常驻）的例外；无配置则全量 lazy
  */
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -364,16 +364,17 @@ export default function (pi: ExtensionAPI) {
 				userConfigPath,
 				projectConfigPath,
 			);
-			if (effectiveConfigPath === null) {
-				// 无有效配置 → 默认全量 lazy：除三常驻外全部按需加载（session_start 时点快照，此后注册的工具默认常驻）
-				const resident = new Set([LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME]);
-				lazyNames = pi
-					.getAllTools()
-					.map((tool) => tool.name)
-					.filter((name) => !resident.has(name));
-			} else {
-				lazyNames = mergeLazyConfigs(userConfig, projectConfig).lazy;
+			// 无有效配置 → 例外为空：全量 lazy（唯三常驻）；名单为 session_start 时点快照，此后注册的工具默认常驻
+			const resident = new Set([LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME]);
+			if (effectiveConfigPath !== null) {
+				for (const name of mergeLazyConfigs(userConfig, projectConfig).resident) {
+					resident.add(name);
+				}
 			}
+			lazyNames = pi
+				.getAllTools()
+				.map((tool) => tool.name)
+				.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
 			activated.clear();
 			definitionCache.clear();

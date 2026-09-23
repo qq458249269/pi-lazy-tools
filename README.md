@@ -7,7 +7,7 @@ pi-lazy-tools：让低频工具像 Skill 一样按需加载的 pi 扩展。
 
 主 Agent 能调用哪些工具、每个工具几千字节的说明书，很大程度上决定了它能做什么。这些说明书每一轮请求都完整出现在上下文里，包括那些 95% 场合根本用不上的工具：主 Agent 不得不一遍遍重新扫过它们，注意力持续被稀释。我们此前做的 [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation) 在 subagent 维度落实了这条「上下文纯净」哲学：主智能体只负责派活、不碰任务细节；工具维度还剩一类问题：低频工具的定义每轮都在场。
 
-Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（--tools 白名单、pi 运行时元数据都不动），会话开始时把名单工具从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由 `load_tools` 以纯文本注入用法、`call_tool` 代理执行，执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。因 tools 字段与系统提示词在会话内再也不变，懒加载不造成任何缓存失效，任意模型通用（论证见[工作原理](#工作原理)）。
+Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（--tools 白名单、pi 运行时元数据都不动），会话开始时把非常驻工具（缺省 = 全部已装工具）从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由 `load_tools` 以纯文本注入用法、`call_tool` 代理执行，执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。因 tools 字段与系统提示词在会话内再也不变，懒加载不造成任何缓存失效，任意模型通用（论证见[工作原理](#工作原理)）。
 
 ## 目录
 
@@ -38,7 +38,7 @@ lazy-tools/
 ├── lazy-tools.ts        # 扩展入口：配置读取、session_start、两个常驻工具
 ├── lazy-tools/
 │   └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
-└── test/                # 88 个测试（node:test + tsx）
+└── test/                # 97 个测试（node:test + tsx）
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -55,22 +55,24 @@ typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 nod
 
 ### 最小配置
 
-无任何配置文件时**默认全量 lazy**：除 `load_tools`、`call_tool`、`skill_search` 三个常驻工具外，全部已装工具（含 `read`、`bash` 等内置工具）按需加载；技能清单亦不入系统提示词，仅经 `skill_search` 检索。写入 `lazy` 数组即回到显式名单模式，`"lazy": []` 表示全部常驻。
+无任何配置文件时**默认全量 lazy**：除 `load_tools`、`call_tool`、`skill_search` 三个常驻工具外，全部已装工具（含 `read`、`bash` 等内置工具）按需加载；技能清单亦不入系统提示词，仅经 `skill_search` 检索。配置文件的 `resident` 数组写**不 lazy（常驻）的例外工具**；`"resident": []` 表示无例外、全部 lazy。
 
 ```jsonc
 // ~/.pi/lazy-tools.json
 {
-  "lazy": ["deploy_tool"]
+  "resident": ["read", "bash"]
 }
 ```
 
-deploy_tool 是示例工具名，实际使用时换成你自己的低频工具，挑选标准见[挑选要 lazy 化的工具](#挑选要-lazy-化的工具)。
+`resident` 里写始终常驻、不参与 lazy 的工具名（示例 read、bash）；其余工具全部按需加载，名单取舍标准见[挑选要 lazy 化的工具](#挑选要-lazy-化的工具)。
 
 放在 `<cwd>/.pi/lazy-tools.json` 则只对当前项目生效，并整体覆盖用户级名单（合并规则见[配置](#配置)）。
 
 ### 挑选要 lazy 化的工具
 
-在 pi 的工具列表里过一遍已注册的工具：description 很长、参数 schema 不小，但实际几天才用一次的工具，就是候选。判断标准两条：低频（几天才用一次）＋ 参数简单（每次调用只有一两个字段）。高频工具别 lazy 化，每次使用多一轮 `load_tools` 往返，反而亏。
+默认已全量 lazy，本节标准反过来用：`resident` 常驻名单只留高频刚需（否则每次使用多一轮 `load_tools` 往返，反而亏），其余留在 lazy 侧。
+
+在 pi 的工具列表里过一遍已注册的工具：description 很长、参数 schema 不小，但实际几天才用一次的工具，就是候选。判断标准两条：低频（几天才用一次）＋ 参数简单（每次调用只有一两个字段）。高频工具应进 `resident` 常驻名单，每次使用多一轮 `load_tools` 往返，反而亏。
 
 ### 使用示例
 
@@ -113,7 +115,7 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 
 四步闸门，任何一步失败都不触碰目标工具：
 
-1. 白名单校验：目标必须在 lazy-tools.json 名单中
+1. 白名单校验：目标必须在当前 lazy 名单中（默认 = 全部非常驻工具）
 2. 激活门槛：必须先经过 `load_tools({ tools: [...], confirm: true })` 激活（激活状态是会话级记忆，会话开始清空）
 3. JSON Schema 预校验：支持 type / required / enum / pattern / properties / additionalProperties / items 子集；不合法时返回字段路径级错误（例：`role: expected one of [admin, member], got "foo"`），目标 execute 不执行
 4. 重放捕获 execute：用伪造的 pi（createFakePi）重放目标扩展的 factory，截获其 registerTool 注册的 ToolDefinition（含真实 execute），按 `${sourcePath}#${name}` memoize（每个工具每会话只重放一次 factory），随后以原始参数、signal、onUpdate、ctx 调用 `definition.execute`，结果原样返回
@@ -138,7 +140,7 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 ~/.pi/lazy-tools.json
 ```
 
-用户级、项目级都没有含 `lazy` 数组的配置时，提示列出两个候选路径并注明均不存在；此时默认全量 lazy，名单列出全部非常驻工具：
+用户级、项目级都没有含 `resident` 数组的配置时，提示列出两个候选路径并注明均不存在；此时默认全量 lazy，名单列出全部非常驻工具：
 
 ```
 当前 lazy 工具名单：
@@ -166,19 +168,19 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 | 用户级 | `~/.pi/lazy-tools.json` | 所有项目的默认名单 |
 | 项目级 | `<cwd>/.pi/lazy-tools.json` | 会话工作目录下的 .pi 目录，覆盖用户级 |
 
-格式：`{ "lazy": string[] }`，示例：`{ "lazy": ["deploy_tool"] }`
+格式：`{ "resident": string[] }`，示例：`{ "resident": ["read", "bash"] }`
 
 合并规则：
 
 | 项目级配置 | 用户级配置 | 生效名单 |
 | --- | --- | --- |
-| 含 `lazy` 数组 | 任意 | 项目级（整体替换，空数组也覆盖） |
-| 缺失或损坏 | 含 `lazy` 数组 | 用户级 |
+| 含 `resident` 数组 | 任意 | 项目级（整体替换，空数组也覆盖） |
+| 缺失或损坏 | 含 `resident` 数组 | 用户级 |
 | 缺失或损坏 | 缺失或损坏 | 默认全量 lazy（除三常驻外全部按需加载） |
 
 文件读取：JSON 解析失败只打告警、按缺失处理；数组中的非字符串项被过滤。配置在 session_start 时读取，会话中途修改不生效，需开新会话。
 
-**注意：--tools 白名单必须保留 lazy 工具。** 注册与隐藏是两件事：--tools 负责注册，扩展只负责隐藏。只加 lazy 名单不进 --tools，`load_tools` 会返回「未找到工具元数据」，加 lazy 工具要两处同步（详见[坑 1](#1---tools-是严格注册白名单)）。
+**注意：--tools 白名单须注册你要按需加载的工具。** 注册与隐藏是两件事：--tools 负责注册，扩展只负责隐藏。未进 `--tools` 的工具 `getAllTools()` 查不到，`load_tools` 会返回「未找到工具元数据」；`resident` 只决定谁常驻、不替代注册（详见[坑 1](#1---tools-是严格注册白名单)）。
 
 ## 工作原理
 
@@ -266,7 +268,7 @@ promptGuidelines 只在工具 active 时进入系统提示词。本设计的工�
 
 #### 1. --tools 是严格注册白名单
 
-不在 `--tools` 名单里的工具连 `getAllTools()` 都查不到，表现为 `load_tools` 返回「未找到工具元数据」。pi-lazy-tools 只负责隐藏可见性；注册必须由 --tools 完成。教训：加 lazy 工具要两处同步，`lazy-tools.json` 与启动命令 `--tools` 缺一不可。
+不在 `--tools` 名单里的工具连 `getAllTools()` 都查不到，表现为 `load_tools` 返回「未找到工具元数据」。pi-lazy-tools 只负责隐藏可见性；注册必须由 --tools 完成。教训：`--tools` 决定注册，`lazy-tools.json` 的 `resident` 决定常驻例外，各管一头、互不替代。
 
 #### 2. 扩展在会话启动时加载
 
@@ -303,7 +305,7 @@ createFakePi 用 `{ ...realPi }` 展开后黑名单打桩：只替换注册类�
 
 #### 适用范围
 
-lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具，注意力不再被低频定义占用。代价是每次使用都要先走 `load_tools` 的两步确认往返，再经 `call_tool` 间接调用。低频、参数简单的工具收益最大（远程代理、会话恢复类）；高频工具请移出名单回归常驻。
+lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具，注意力不再被低频定义占用。代价是每次使用都要先走 `load_tools` 的两步确认往返，再经 `call_tool` 间接调用。低频、参数简单的工具收益最大（远程代理、会话恢复类）；高频工具请写进 `resident` 常驻名单。
 
 #### 排障清单
 
@@ -319,7 +321,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 
 ## 开发
 
-测试位于 `test/`，88 个用例（68 单元 + 20 集成）：
+测试位于 `test/`，97 个用例（68 单元 + 29 集成）：
 
 ```bash
 cd pi-lazy-tools

@@ -101,7 +101,7 @@ interface BootOptions {
 }
 
 interface Harness {
-	boot(lazyNames?: string[], options?: BootOptions): Promise<void>;
+	boot(residentNames?: string[], options?: BootOptions): Promise<void>;
 	cleanup(): void;
 	loadTools(names: string[], options?: { confirm?: boolean }): Promise<unknown>;
 	callTool(tool: string, params: unknown): Promise<unknown>;
@@ -218,7 +218,7 @@ function createHarness(): Harness {
 	);
 
 	return {
-		async boot(lazyNames: string[] = [FAKE_TOOL_NAME], options: BootOptions = {}): Promise<void> {
+		async boot(residentNames: string[] = [], options: BootOptions = {}): Promise<void> {
 			resetGlobalCounters();
 			notifyCalls.length = 0;
 			setActiveToolsCalls = 0;
@@ -229,7 +229,7 @@ function createHarness(): Harness {
 			if (options.writeProjectConfig !== false) {
 				writeFileSync(
 					join(workspace, ".pi", "lazy-tools.json"),
-					JSON.stringify({ lazy: lazyNames }),
+					JSON.stringify({ resident: residentNames }),
 				);
 			}
 
@@ -342,13 +342,13 @@ function createHarness(): Harness {
 
 /** 建立临时工作区 → 触发 session_start → 运行用例 → 清理。 */
 async function withHarness<T>(
-	lazyNames: string[] | undefined,
+	residentNames: string[] | undefined,
 	fn: (h: Harness) => Promise<T>,
 	bootOptions: BootOptions = {},
 ): Promise<T> {
 	const h = createHarness();
 	try {
-		await h.boot(lazyNames, bootOptions);
+		await h.boot(residentNames, bootOptions);
 		return await fn(h);
 	} finally {
 		h.cleanup();
@@ -373,7 +373,7 @@ async function captureWarnings(fn: () => Promise<void>): Promise<unknown[][]> {
 describe("lazy-tools extension wiring (call_tool path)", () => {
 	// B6: 未激活拒绝
 	it("should refuse to call a whitelisted tool that has not been activated via load_tools", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /激活/);
 			await assert.rejects(h.callTool(FAKE_TOOL_NAME, { action: "discover" }), /confirm: true/);
 			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "target execute must not run");
@@ -388,7 +388,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B7: 白名单外拒绝
 	it("should refuse a tool that is not on the lazy whitelist", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await assert.rejects(h.callTool("evil_tool", { action: "discover" }), /lazy 名单/);
 			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "target execute must not run");
 		});
@@ -396,7 +396,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B8: 参数不合法 → 结构化错误（字段路径），目标不执行
 	it("should reject invalid target params with a field-path error and never execute the target", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await assert.rejects(
 				h.callTool(FAKE_TOOL_NAME, { action: "nope" }),
@@ -408,7 +408,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B9: 合法参数 → 目标执行且结果透传
 	it("should invoke the target execute and pass through its result for valid params", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			const result = (await h.callTool(FAKE_TOOL_NAME, { action: "discover" })) as RenderedResult;
 			assert.match(result.content[0].text, /fake ran: discover/);
@@ -419,7 +419,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B10: findToolDefinition 应按 (sourcePath, name) memoize —— factory 只跑一次
 	it("should load the target tool definition only once across repeated call_tool invocations", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await h.callTool(FAKE_TOOL_NAME, { action: "discover" });
 			await h.callTool(FAKE_TOOL_NAME, { action: "submit" });
@@ -433,7 +433,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B11: 目标 factory 里的 pi.events.on 不得订阅到真实 pi
 	it("should stub events.on on the fake pi so the target factory never subscribes to the real pi", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			await h.loadTools([FAKE_TOOL_NAME], { confirm: true });
 			await h.callTool(FAKE_TOOL_NAME, { action: "discover" });
 			assert.equal(
@@ -446,7 +446,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B12: 首调无 confirm → 返回挑战（content 含工具名/"confirm: true"），details.confirmRequired === true，零副作用
 	it("should return a challenge without activating anything when confirm is omitted", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([FAKE_TOOL_NAME])) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -465,7 +465,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B13: 首调显式 confirm:false → 同样返回挑战、不激活
 	it("should return a challenge and not activate when confirm is explicitly false", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([FAKE_TOOL_NAME], { confirm: false })) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -481,7 +481,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B14: confirm:true → 激活成功，callTool 正常执行
 	it("should activate and load tools when confirm is true", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([FAKE_TOOL_NAME], { confirm: true })) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -498,7 +498,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B15: 全部不在名单（rejected 非空、accepted 空）→ 直接返回拒绝结果，不进确认门
 	it("should reject immediately without a challenge when nothing is on the lazy whitelist", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools(["not_on_whitelist"], { confirm: false })) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -514,7 +514,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B16: 空数组请求 → 现有行为（"没有请求任何工具。"），不进确认门
 	it("should return the no-request notice without a challenge for an empty tools array", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([], { confirm: false })) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -525,7 +525,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B17: 首调无 confirm → challenge 文本含「用户主动要求」提示（约束层：仅在用户主动要求时才加载工具）
 	it("should include a user-explicitly-asks constraint in the challenge text (integration)", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([FAKE_TOOL_NAME])) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -539,7 +539,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B17b: 混合请求边界（白名单内 + 白名单外，confirm 缺省）→ 返回挑战，rejected 不进挑战文本
 	it("should return a challenge for whitelisted tools while rejecting off-whitelist tools, without leaking rejected names into the challenge text", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const result = (await h.loadTools([FAKE_TOOL_NAME, "not_on_whitelist"])) as LoadToolsResult;
 			const text = result.content[0].text;
 
@@ -570,7 +570,7 @@ describe("lazy-tools extension wiring (call_tool path)", () => {
 
 	// B18: 注册的 load_tools 工具的 promptGuidelines 包含用户主动要求约束
 	it("should register load_tools with a user-explicitly-asks prompt guideline", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const tool = h.getRegisteredTool("load_tools");
 			assert.ok(tool !== undefined, "load_tools should be registered");
 
@@ -592,7 +592,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 	// C1: boot 后恰好通知一次；情况一文案：名单 + 「当前生效的配置文件为：」+ 项目级路径
 	// （harness 临时工作区 .pi/lazy-tools.json 是项目级且优先 → 情况一；不逐一标注用户级/项目级）
 	it("should notify the tool list and the effective project config path once on session_start", async () => {
-		await withHarness([FAKE_TOOL_NAME, "openaas"], async (h) => {
+		await withHarness([], async (h) => {
 			const calls = h.getNotifyCalls();
 			assert.equal(calls.length, 1, "session_start should call ctx.ui.notify exactly once");
 
@@ -601,7 +601,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 			// 名单：表头 + 逐行列出每个工具名
 			assert.ok(text.includes("当前 lazy 工具名单："), `notice should have the list header; got: ${text}`);
 			assert.ok(text.includes(FAKE_TOOL_NAME), `notice should list ${FAKE_TOOL_NAME}; got: ${text}`);
-			assert.ok(text.includes("openaas"), `notice should list openaas; got: ${text}`);
+			// 只有一个非三常驻工具，openaas 未注册不入名单（resident 例外见下方用例）
 
 			// 情况一：项目级配置存在且优先 → 「当前生效的配置文件为：」+ 项目级路径
 			const workspacePath = h.getWorkspacePath();
@@ -630,11 +630,27 @@ describe("lazy-tools startup notice (session_start)", () => {
 		});
 	});
 
+	// resident 例外：写进配置的工具退出 lazy 名单（名单为空时提示（空）+ 生效路径照常）
+	it("should keep configured resident tools out of the lazy list", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const text = h.getNotifyCalls()[0].text;
+			assert.ok(
+				!text.includes(FAKE_TOOL_NAME),
+				`resident tool must be excluded from the lazy list; got: ${text}`,
+			);
+			assert.ok(text.includes("（空）"), `resident-only roster renders empty; got: ${text}`);
+			assert.ok(
+				text.includes("当前生效的配置文件为："),
+				`resident config must still be marked effective; got: ${text}`,
+			);
+		});
+	});
+
 	// 新契约：仅 reason === "startup" 弹通知；new/resume/fork/reload 不弹，但 setActiveTools 仍执行
 	it("should skip notify for non-startup reasons but still run setActiveTools", async () => {
 		const reasons: SessionReason[] = ["new", "resume", "fork", "reload"];
 		for (const reason of reasons) {
-			await withHarness([FAKE_TOOL_NAME], async (h) => {
+			await withHarness([], async (h) => {
 				assert.equal(
 					h.getNotifyCalls().length,
 					0,
@@ -650,7 +666,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 
 	// 新契约：两处都无配置文件（项目级不写 + 用户级指向不存在的临时 HOME）→ 情况二文案
 	it("should notify the no-config notice when neither user nor project config exists", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const calls = h.getNotifyCalls();
 			assert.equal(calls.length, 1, "session_start should notify once even without any config");
 
@@ -699,7 +715,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 	// C2: ctx 完全没有 ui → 静默跳过，handler 其余逻辑照常完成、不产生失败告警
 	it("should skip notify silently when the session ctx has no ui", async () => {
 		const warnings = await captureWarnings(async () => {
-			await withHarness([FAKE_TOOL_NAME], async (h) => {
+			await withHarness([], async (h) => {
 				assert.equal(h.getNotifyCalls().length, 0, "notify must not be called without ctx.ui");
 				assert.ok(
 					h.getSetActiveToolsCalls() > 0,
@@ -718,7 +734,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 	// C3: ui 存在但 notify 不存在 → 同样静默跳过
 	it("should skip notify silently when ctx.ui has no notify", async () => {
 		const warnings = await captureWarnings(async () => {
-			await withHarness([FAKE_TOOL_NAME], async (h) => {
+			await withHarness([], async (h) => {
 				assert.equal(h.getNotifyCalls().length, 0, "notify must not be called without ui.notify");
 				assert.ok(
 					h.getSetActiveToolsCalls() > 0,
@@ -740,7 +756,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 	it("should still run setActiveTools when ctx.ui.notify throws", async () => {
 		let notifyAttempts = 0;
 		const warnings = await captureWarnings(async () => {
-			await withHarness([FAKE_TOOL_NAME], async (h) => {
+			await withHarness([], async (h) => {
 				assert.equal(
 					notifyAttempts,
 					1,
@@ -823,7 +839,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 
 	// T-A：注册面（description / promptSnippet / promptGuidelines）不得含黑名单字面量
 	it("should keep every banned tool-name literal out of description, promptSnippet, and promptGuidelines", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const copy = getLoadToolsCopy(h);
 			const fields: Record<string, string> = {
 				description: copy.description,
@@ -846,7 +862,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 	// T-A 动态版：任何在本 harness 中注册的工具名都不许出现在注册文案里
 	//（load_tools/call_tool 自身除外——文案本来就要教模型用这两个动作）。
 	it("should not mention the name of any registered tool other than load_tools and call_tool", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const copy = getLoadToolsCopy(h);
 			const all = [copy.description, copy.promptSnippet, ...copy.promptGuidelines]
 				.join("\n")
@@ -865,7 +881,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 
 	// T-A 语义版：guidelines 不得保留专指某一工具的特定能力短语（恢复/继续 subagent 会话）
 	it("should not keep capability-specific phrasing in promptGuidelines", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const copy = getLoadToolsCopy(h);
 			const text = copy.promptGuidelines.join("\n").toLowerCase();
 
@@ -893,7 +909,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 
 	// T-C：description 仍表达“先 load_tools、再 call_tool”的用法（非逐字相等，只锁性质）
 	it("should keep description non-trivial and mention both the load and call actions in order", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const { description } = getLoadToolsCopy(h);
 
 			assert.ok(description.trim().length >= 20, `description must stay substantive (>= 20 chars), not an empty or stub string; got: ${JSON.stringify(description)}`);
@@ -908,7 +924,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 
 	// T-C：promptSnippet 仍同时表达 load 与 call 两个动作名（不得退化成空串/单字/只提一边）
 	it("should keep promptSnippet non-trivial and mention both the load and call actions", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const { promptSnippet } = getLoadToolsCopy(h);
 
 			assert.ok(promptSnippet.trim().length >= 30, `promptSnippet must stay substantive (>= 30 chars); got: ${JSON.stringify(promptSnippet)}`);
@@ -919,7 +935,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 
 	// T-C：promptGuidelines 仍覆盖 load 与 call 两个动作名，且每条都不退化
 	it("should keep promptGuidelines non-trivial and cover both the load and call actions", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const { promptGuidelines } = getLoadToolsCopy(h);
 
 			assert.ok(promptGuidelines.length > 0, "promptGuidelines must not become an empty array");
@@ -937,7 +953,7 @@ describe("generic registration copy (decoupled from local tool names)", () => {
 //（pi 0.84.x 无 sections → 扩展回传重写后的整串 systemPrompt）
 describe("lazy-skills", () => {
 	it("should strip the skills prompt section and search skills via skill_search", async () => {
-		await withHarness([FAKE_TOOL_NAME], async (h) => {
+		await withHarness([], async (h) => {
 			const search = h.getRegisteredTool("skill_search");
 			assert.ok(search !== undefined, "skill_search should be registered");
 

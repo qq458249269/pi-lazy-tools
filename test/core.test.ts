@@ -5,7 +5,7 @@
  *   /Users/liuyu/pi-workspace/pi-lazy-tools/lazy-tools/core.ts
  *
  * Contract under test (no pi runtime, no typebox imports):
- *   mergeLazyConfigs(userCfg, projectCfg)                -> { lazy: string[] }
+ *   mergeLazyConfigs(userCfg, projectCfg)                -> { resident: string[] }
  *   filterAllowedTools(requested, whitelist)             -> { allowed, rejected }
  *   validateParams(schema, params)                       -> { ok, errors }
  *   canCall(tool, whitelist, activatedSet)               -> { ok, reason }
@@ -114,47 +114,47 @@ function expectErrors(result: { ok: boolean; errors: string[] }, ...fragments: s
 // ===== mergeLazyConfigs =====
 
 describe("mergeLazyConfigs", () => {
-	it("should return { lazy: [] } when both configs are null (missing/corrupt files)", () => {
-		assert.deepEqual(mergeLazyConfigs(null, null), { lazy: [] });
+	it("should return { resident: [] } when both configs are null (missing/corrupt files)", () => {
+		assert.deepEqual(mergeLazyConfigs(null, null), { resident: [] });
 	});
 
 	it("should fall back to user config when project config is null", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: ["a", "b"] }, null), { lazy: ["a", "b"] });
+		assert.deepEqual(mergeLazyConfigs({ resident: ["a", "b"] }, null), { resident: ["a", "b"] });
 	});
 
-	it("should fall back to user config when project config has no lazy array", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: ["a"] }, { other: 1 }), { lazy: ["a"] });
+	it("should fall back to user config when project config has no resident array", () => {
+		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { other: 1 }), { resident: ["a"] });
 	});
 
-	it("should replace user config entirely when project config has a lazy array", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: ["a"] }, { lazy: ["p1", "p2"] }), {
-			lazy: ["p1", "p2"],
+	it("should replace user config entirely when project config has a resident array", () => {
+		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: ["p1", "p2"] }), {
+			resident: ["p1", "p2"],
 		});
 	});
 
-	it("should treat an empty lazy array in project config as an explicit replace", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: ["a"] }, { lazy: [] }), { lazy: [] });
+	it("should treat an empty resident array in project config as an explicit replace", () => {
+		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: [] }), { resident: [] });
 	});
 
-	it("should accept an empty lazy array in user config when project is null", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: [] }, null), { lazy: [] });
+	it("should accept an empty resident array in user config when project is null", () => {
+		assert.deepEqual(mergeLazyConfigs({ resident: [] }, null), { resident: [] });
 	});
 
 	it("should treat a non-array lazy field as absent and fall back to user config", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: ["a"] }, { lazy: "oops" }), { lazy: ["a"] });
+		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: "oops" }), { resident: ["a"] });
 	});
 
-	it("should filter non-string entries out of the lazy array", () => {
-		const project = { lazy: ["a", 1, null, true, "b", { x: 1 }] };
-		assert.deepEqual(mergeLazyConfigs(null, project), { lazy: ["a", "b"] });
+	it("should filter non-string entries out of the resident array", () => {
+		const project = { resident: ["a", 1, null, true, "b", { x: 1 }] };
+		assert.deepEqual(mergeLazyConfigs(null, project), { resident: ["a", "b"] });
 	});
 
-	it("should return { lazy: [] } when neither config has a valid lazy array", () => {
-		assert.deepEqual(mergeLazyConfigs({ lazy: 42 }, { other: "x" }), { lazy: [] });
+	it("should return { resident: [] } when neither config has a valid resident array", () => {
+		assert.deepEqual(mergeLazyConfigs({ resident: 42 }, { other: "x" }), { resident: [] });
 	});
 
-	it("should return { lazy: [] } for empty config objects", () => {
-		assert.deepEqual(mergeLazyConfigs({}, {}), { lazy: [] });
+	it("should return { resident: [] } for empty config objects", () => {
+		assert.deepEqual(mergeLazyConfigs({}, {}), { resident: [] });
 	});
 });
 
@@ -435,18 +435,18 @@ describe("selectEffectiveConfigPath", () => {
 	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
 	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
 
-	// 项目级含有效 lazy 数组（非空）→ 项目级，即使用户级同样有效
-	it("should pick the project path when the project config has a non-empty lazy array", () => {
+	// 项目级含有效 resident 数组（非空）→ 项目级，即使用户级同样有效
+	it("should pick the project path when the project config has a non-empty resident array", () => {
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: ["p1", "p2"] }, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: ["u"] }, { resident: ["p1", "p2"] }, USER_PATH, PROJECT_PATH),
 			PROJECT_PATH,
 		);
 	});
 
 	// 项目级空数组 → 仍算有效（显式覆盖用户级），返回项目级
-	it("should pick the project path when the project config has an empty lazy array", () => {
+	it("should pick the project path when the project config has an empty resident array", () => {
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: [] }, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: ["u"] }, { resident: [] }, USER_PATH, PROJECT_PATH),
 			PROJECT_PATH,
 		);
 	});
@@ -454,7 +454,7 @@ describe("selectEffectiveConfigPath", () => {
 	// 项目级 lazy 非数组 → 视为无效，回退用户级
 	it("should fall back to the user path when the project lazy field is not an array", () => {
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: ["u"] }, { lazy: "oops" }, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: ["u"] }, { resident: "oops" }, USER_PATH, PROJECT_PATH),
 			USER_PATH,
 		);
 	});
@@ -462,29 +462,29 @@ describe("selectEffectiveConfigPath", () => {
 	// 项目级缺失（null）→ 回退用户级
 	it("should fall back to the user path when the project config is missing", () => {
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: ["u"] }, null, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: ["u"] }, null, USER_PATH, PROJECT_PATH),
 			USER_PATH,
 		);
 	});
 
 	// 非字符串项被过滤但不影响数组本身的有效性（与 mergeLazyConfigs 同源）
 	it("should still treat the project array as valid when it contains non-string entries", () => {
-		const project = { lazy: ["p", 1, null, true, { x: 1 }] };
+		const project = { resident: ["p", 1, null, true, { x: 1 }] };
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: ["u"] }, project, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: ["u"] }, project, USER_PATH, PROJECT_PATH),
 			PROJECT_PATH,
 		);
 	});
 
-	// 两者皆无有效 lazy 数组 → null
-	it("should return null when neither config has a valid lazy array", () => {
+	// 两者皆无有效 resident 数组 → null
+	it("should return null when neither config has a valid resident array", () => {
 		assert.equal(
-			selectEffectiveConfigPath({ lazy: 42 }, { other: "x" }, USER_PATH, PROJECT_PATH),
+			selectEffectiveConfigPath({ resident: 42 }, { other: "x" }, USER_PATH, PROJECT_PATH),
 			null,
 		);
 	});
 
-	// 两者全空/缺失 → null（与 mergeLazyConfigs 返回 { lazy: [] } 的语义同源）
+	// 两者全空/缺失 → null（与 mergeLazyConfigs 返回 { resident: [] } 的语义同源）
 	it("should return null when both configs are null or empty", () => {
 		assert.equal(selectEffectiveConfigPath(null, null, USER_PATH, PROJECT_PATH), null);
 		assert.equal(selectEffectiveConfigPath({}, {}, USER_PATH, PROJECT_PATH), null);
