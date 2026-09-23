@@ -27,15 +27,18 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Wolido/pi-lazy-tools.git"
+    "url": "git+https://github.com/qq458249269/pi-lazy-tools.git"
   },
-  "homepage": "https://github.com/Wolido/pi-lazy-tools#readme",
+  "homepage": "https://github.com/qq458249269/pi-lazy-tools#readme",
   "bugs": {
     "url": "https://github.com/Wolido/pi-lazy-tools/issues"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "dependencies": {
+    "jiti": "^2.7.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",

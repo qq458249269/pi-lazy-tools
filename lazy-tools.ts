@@ -14,7 +14,7 @@
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { createRequire } from "node:module";
+import { createJiti } from "jiti";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as fs from "node:fs";
@@ -33,7 +33,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const requireFn = typeof require !== "undefined" ? require : createRequire(import.meta.url);
+const requireFn = createJiti(import.meta.url);
 
 const CONFIG_NAME = "lazy-tools.json";
 const LOADER_NAME = "load_tools";
@@ -113,8 +113,7 @@ async function findToolDefinition(sourcePath: string, name: string, realPi: Exte
 	if (cached) return cached;
 
 	try {
-		const mod = requireFn(sourcePath);
-		const factory = mod?.default ?? mod;
+		const factory = await requireFn.import(sourcePath.replaceAll("\\", "/"), { default: true });
 		if (typeof factory !== "function") {
 			return undefined;
 		}
