@@ -337,6 +337,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event) => {
 		skills = event.systemPromptOptions.skills ?? [];
 		if (skills.length === 0) return;
+		const { sections } = event.systemPromptOptions;
+		if (sections) {
+			// 0.86+：只改 section，pi 仅在内容变化时记 transcript delta，轮间字节稳定（前缀缓存不散）
+			sections.skills = SKILLS_NOTE;
+			return;
+		}
+		// 0.86 前无 sections：正则剥离后整串回传（强制路径）
 		const stripped = event.systemPrompt.replace(
 			/\n\nThe following skills provide specialized instructions[\s\S]*?<\/available_skills>/,
 			"",
@@ -351,17 +358,25 @@ export default function (pi: ExtensionAPI) {
 			const projectConfigPath = join(cwd, ".pi", CONFIG_NAME);
 			const userConfig = readConfigFile(userConfigPath);
 			const projectConfig = readConfigFile(projectConfigPath);
-			lazyNames = mergeLazyConfigs(userConfig, projectConfig).lazy;
-			lazySet = new Set(lazyNames);
-			activated.clear();
-			definitionCache.clear();
-
 			const effectiveConfigPath = selectEffectiveConfigPath(
 				userConfig,
 				projectConfig,
 				userConfigPath,
 				projectConfigPath,
 			);
+			if (effectiveConfigPath === null) {
+				// 无有效配置 → 默认全量 lazy：除三常驻外全部按需加载（session_start 时点快照，此后注册的工具默认常驻）
+				const resident = new Set([LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME]);
+				lazyNames = pi
+					.getAllTools()
+					.map((tool) => tool.name)
+					.filter((name) => !resident.has(name));
+			} else {
+				lazyNames = mergeLazyConfigs(userConfig, projectConfig).lazy;
+			}
+			lazySet = new Set(lazyNames);
+			activated.clear();
+			definitionCache.clear();
 			const notice = buildStartupNotice({
 				toolNames: lazyNames,
 				userConfigPath,

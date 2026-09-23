@@ -33,9 +33,6 @@
   "bugs": {
     "url": "https://github.com/Wolido/pi-lazy-tools/issues"
   },
-  "dependencies": {
-    "jiti": "^2.7.0"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
@@ -44,10 +41,10 @@
     "jiti": "^2.7.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
+    "typebox": "*",
     "typescript": "^7.0.2"
   },
   "publishConfig": {

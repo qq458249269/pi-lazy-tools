@@ -70,9 +70,12 @@ type SessionHandler = (
 	ctx: { cwd?: string; ui?: { notify?: (text: string, options?: unknown) => void } },
 ) => void | Promise<void>;
 
-/** before_agent_start handler 的最小形态（扩展只消费 systemPrompt / systemPromptOptions.skills）。 */
+/** before_agent_start handler 的最小形态（扩展消费 systemPrompt、systemPromptOptions.skills 与 sections）。 */
 type BeforeAgentStartHandler = (
-	event: { systemPrompt: string; systemPromptOptions: { skills?: unknown[] } },
+	event: {
+		systemPrompt: string;
+		systemPromptOptions: { skills?: unknown[]; sections?: Record<string, string> };
+	},
 ) => { systemPrompt?: string } | void;
 
 /** boot() 构造 session ctx/event 的选项（覆盖通知缺失/抛错、reason、配置文件缺失分支）。 */
@@ -255,10 +258,13 @@ function createHarness(): Harness {
 			// 用户级路径控制：os.homedir() 读 $HOME（POSIX），架空 HOME 使两处都无配置可测。
 			// 无论 handler 是否抛错都在 finally 里还原并清理临时 HOME，不留跨用例残留。
 			const originalHome = process.env.HOME;
+			// Windows：os.homedir() 读 USERPROFILE/HOMEDRIVE+HOMEPATH，不读 $HOME，一并架空
+			const originalProfile = process.env.USERPROFILE;
 			let tempUserHome: string | undefined;
 			if (options.freshUserHome) {
 				tempUserHome = mkdtempSync(join(tmpdir(), "lazy-tools-home-"));
 				process.env.HOME = tempUserHome;
+				process.env.USERPROFILE = tempUserHome;
 				userHome = tempUserHome;
 			}
 
@@ -270,6 +276,8 @@ function createHarness(): Harness {
 				if (tempUserHome !== undefined) {
 					if (originalHome === undefined) delete process.env.HOME;
 					else process.env.HOME = originalHome;
+					if (originalProfile === undefined) delete process.env.USERPROFILE;
+					else process.env.USERPROFILE = originalProfile;
 					rmSync(tempUserHome, { recursive: true, force: true });
 				}
 			}
@@ -652,8 +660,12 @@ describe("lazy-tools startup notice (session_start)", () => {
 			assert.ok(workspacePath, "harness should own a temp workspace");
 			assert.ok(userHomePath, "harness should own a temp user home");
 
-			// 情况二：名单必为（空）
-			assert.ok(text.includes("（空）"), `notice should mark the empty list; got: ${text}`);
+			// 情况二：无配置 → 默认全量 lazy，名单为全部非常驻工具
+			assert.ok(
+				text.includes(FAKE_TOOL_NAME),
+				`notice should list the default lazy-all roster; got: ${text}`,
+			);
+			assert.ok(!text.includes("（空）"), `default roster must not be empty; got: ${text}`);
 
 			// 双路径分别列出 + 空行 + 「以上两个文件均不存在」
 			assert.ok(
@@ -975,6 +987,16 @@ describe("lazy-skills", () => {
 
 			const miss = await execute("", { query: "zzz-not-there" });
 			assert.ok(miss.content[0]!.text.length > 0, "empty search should still return text");
+
+			// 0.86+ 路径：改 sections.skills，不回传整串（pi 按差异记 delta，前缀缓存不散）
+			const sections = { skills: "<skills>\nold skill block\n</skills>" };
+			const forced = h.fireBeforeAgentStart({ skills, sections }, basePrompt);
+			assert.equal(forced, undefined, "sections path must not return a forced system prompt");
+			assert.ok(
+				sections.skills.includes("skill_search"),
+				`sections.skills should be replaced by the note; got: ${sections.skills}`,
+			);
+			assert.ok(!sections.skills.includes("old skill block"), "stale skills content must be gone");
 		});
 	});
 });

@@ -4,7 +4,6 @@ pi-lazy-tools：让低频工具像 Skill 一样按需加载的 pi 扩展。
 
 > [English](README.en.md) | 中文
 >
-> npm 包名：@wolido/pi-lazy-tools
 
 主 Agent 能调用哪些工具、每个工具几千字节的说明书，很大程度上决定了它能做什么。这些说明书每一轮请求都完整出现在上下文里，包括那些 95% 场合根本用不上的工具：主 Agent 不得不一遍遍重新扫过它们，注意力持续被稀释。我们此前做的 [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation) 在 subagent 维度落实了这条「上下文纯净」哲学：主智能体只负责派活、不碰任务细节；工具维度还剩一类问题：低频工具的定义每轮都在场。
 
@@ -25,13 +24,13 @@ Skills 对同类问题的解法是渐进式披露（progressive disclosure）：
 
 ### 安装
 
-npm 方式（@wolido/pi-lazy-tools 发布后可用）：
-
 ```bash
-pi install npm:@wolido/pi-lazy-tools
+pi install git:github.com/qq458249269/pi-lazy-tools
 ```
 
-当前方式（包发布前，手动复制）：把 `lazy-tools.ts` 与 `lazy-tools/` 复制到扩展目录（项目级 `<cwd>/.pi/extensions/` 或用户级 `~/.pi/extensions/`），文件布局：
+个人级写入 `~/.pi/agent/settings.json`；加 `--local` 改写项目级 `.pi/settings.json`（需先信任项目）。`pi update --extensions` 对账更新，`pi remove git:github.com/qq458249269/pi-lazy-tools` 卸载。
+
+仓库布局：
 
 ```
 lazy-tools/
@@ -48,13 +47,15 @@ lazy-tools/
 
 安装后还需三步：
 
-1. 写配置（见[最小配置](#最小配置)）
+1. 写配置（见[最小配置](#最小配置)；不写则默认全量 lazy）
 2. 启动命令的 `--tools` 白名单里保留 lazy 工具（注册与隐藏是两件事，详见[配置](#配置)）
 3. 开新会话生效（扩展在会话启动时加载，旧会话没有 `load_tools`）
 
 typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 node_modules）。
 
 ### 最小配置
+
+无任何配置文件时**默认全量 lazy**：除 `load_tools`、`call_tool`、`skill_search` 三个常驻工具外，全部已装工具（含 `read`、`bash` 等内置工具）按需加载；技能清单亦不入系统提示词，仅经 `skill_search` 检索。写入 `lazy` 数组即回到显式名单模式，`"lazy": []` 表示全部常驻。
 
 ```jsonc
 // ~/.pi/lazy-tools.json
@@ -137,11 +138,15 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 ~/.pi/lazy-tools.json
 ```
 
-生效配置按[配置](#配置)的合并规则判定：项目级配置含 `lazy` 数组时项目级生效，否则回落到用户级。用户级、项目级都没有含 `lazy` 数组的配置时，提示列出两个候选路径并注明均不存在；此时名单必为空，因为名单只来源于配置文件：
+用户级、项目级都没有含 `lazy` 数组的配置时，提示列出两个候选路径并注明均不存在；此时默认全量 lazy，名单列出全部非常驻工具：
 
 ```
 当前 lazy 工具名单：
-（空）
+- read
+- bash
+- edit
+- write
+- …（全部非常驻工具）
 
 当前暂无配置文件：
 用户级：~/.pi/lazy-tools.json
@@ -169,7 +174,7 @@ deploy_tool 是示例工具名，实际使用时换成你自己的低频工具�
 | --- | --- | --- |
 | 含 `lazy` 数组 | 任意 | 项目级（整体替换，空数组也覆盖） |
 | 缺失或损坏 | 含 `lazy` 数组 | 用户级 |
-| 缺失或损坏 | 缺失或损坏 | 空名单（扩展可用，但无工具可加载） |
+| 缺失或损坏 | 缺失或损坏 | 默认全量 lazy（除三常驻外全部按需加载） |
 
 文件读取：JSON 解析失败只打告警、按缺失处理；数组中的非字符串项被过滤。配置在 session_start 时读取，会话中途修改不生效，需开新会话。
 

@@ -25,13 +25,13 @@ Skills solve the same problem with progressive disclosure: load only what is nee
 
 ### Installation
 
-npm (available once @wolido/pi-lazy-tools is published):
-
 ```bash
-pi install npm:@wolido/pi-lazy-tools
+pi install git:github.com/qq458249269/pi-lazy-tools
 ```
 
-Current approach (manual copy, until the package is published): copy `lazy-tools.ts` and `lazy-tools/` into the extensions directory (project `<cwd>/.pi/extensions/` or user `~/.pi/extensions/`). Layout:
+Personal installs are written to `~/.pi/agent/settings.json`; add `--local` to write to the project-level `.pi/settings.json` (requires project trust first). `pi update --extensions` reconciles updates; `pi remove git:github.com/qq458249269/pi-lazy-tools` uninstalls.
+
+Repository layout:
 
 ```
 lazy-tools/
@@ -39,7 +39,7 @@ lazy-tools/
 ├── lazy-tools.ts        # extension entry: config loading, session_start, the two resident tools
 ├── lazy-tools/
 │   └── core.ts          # pure logic layer: no pi runtime, no typebox, unit-testable
-└── test/                # 88 tests (node:test + tsx)
+└── test/                # 96 tests (node:test + tsx)
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -48,13 +48,15 @@ lazy-tools/
 
 Three more steps after installation:
 
-1. Write the config (see [Minimal config](#minimal-config))
+1. Write the config (see [Minimal config](#minimal-config); without one, everything is lazy by default)
 2. Keep lazy tools in the `--tools` whitelist of the launch command (registration and hiding are two separate things, see [Configuration](#configuration))
 3. Start a new session (extensions load at session start; an old session has no `load_tools`)
 
 typebox: the extension imports typebox directly (the same one pi uses; it lives in the root node_modules).
 
 ### Minimal config
+
+With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the resident `load_tools`, `call_tool`, `skill_search`; the skills roster stays out of the system prompt too and is reachable only via `skill_search`. Writing a `lazy` array switches to explicit-list mode, and `"lazy": []` keeps everything resident.
 
 ```jsonc
 // ~/.pi/lazy-tools.json
@@ -169,7 +171,7 @@ Merge rules:
 | --- | --- | --- |
 | Has a `lazy` array | Anything | Project (full replacement; an empty array also wins) |
 | Missing or corrupt | Has a `lazy` array | User |
-| Missing or corrupt | Missing or corrupt | Empty (the extension works, nothing to load) |
+| Missing or corrupt | Missing or corrupt | Lazy everything by default (only the resident trio stays active) |
 
 Reading: a JSON parse failure logs a warning and is treated as missing; non-string entries in the array are filtered out. Config is read at session_start; edits mid-session take effect only after starting a new session.
 
