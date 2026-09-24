@@ -47,6 +47,21 @@ interface SkillMeta {
 const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按其命中结果 read 对应 SKILL.md。";
 
 /**
+ * rules/docs 压缩版（削减首请求 token）。原文由 pi 生成，冗余长句多；
+ * 此处保留全部语义要点，仅去解释性赘述。若需完整原文，删此二常量即可。
+ * 注意：pi 会自行给 section 内容包 `<rules>`/`</rules>` 标签，故此处放裸文本，勿自带标签（否则双嵌套）。
+ */
+const RULES_NOTE =
+	"- 文件操作用 bash (ls, rg, find)；读文件用 read。\n" +
+	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
+	"- 新文件/整体重写用 write。\n" +
+	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
+	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
+
+const DOCS_NOTE =
+	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 docs/ 与 examples/（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
+
+/**
  * Read a single lazy-tools config file. Returns null if the file is missing or
  * malformed; warnings are logged for unexpected errors.
  */
@@ -218,8 +233,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: OMNIFY_NAME,
 		label: "Omnify",
-		description:
-			"按 goal 搜索并调用 lazy 工具/技能：无 args 返候选参数摘要；有 args 校验即执行；未匹配返名录与技能路径。tool 显式指名，避开搜索。",
+		description: "按 goal 搜并调 lazy 工具/技能：无 args 返候选参数要求；有 args 校验执行；未匹配返名录与技能路径。tool 指名跳过搜索。",
 		promptSnippet: "想完成某事而不知用何工具/技能时，先试 omnify。",
 		promptGuidelines: [
 			"无 args：返候选参数要求，补 args 重试。",
@@ -337,13 +351,16 @@ export default function (pi: ExtensionAPI) {
 	// pi 0.84.x 无 sections 字段：须回传整串 systemPrompt 方能生效（每轮均触发）。
 	pi.on("before_agent_start", (event) => {
 		skills = event.systemPromptOptions.skills ?? [];
-		if (skills.length === 0) return;
 		const { sections } = event.systemPromptOptions;
 		if (sections) {
 			// 0.86+：只改 section，pi 仅在内容变化时记 transcript delta，轮间字节稳定（前缀缓存不散）
-			sections.skills = SKILLS_NOTE;
+			if (skills.length > 0) sections.skills = SKILLS_NOTE;
+			// 压缩 rules/docs 以削减首请求 token；skills 空时仍压缩（与 skills 无关）
+			sections.rules = RULES_NOTE;
+			sections.docs = DOCS_NOTE;
 			return;
 		}
+		if (skills.length === 0) return;
 		// 0.86 前无 sections：正则剥离后整串回传（强制路径）
 		const stripped = event.systemPrompt.replace(
 			/\n\nThe following skills provide specialized instructions[\s\S]*?<\/available_skills>/,

@@ -55,7 +55,7 @@ typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 nod
 
 ### 最小配置
 
-无任何配置文件时**默认全量 lazy**：除单入口 `omnify` 常驻外，全部已装工具（含 `read`、`bash` 等内置工具）按需加载；技能清单也不入系统提示词，由 omnify 检索并返回其 SKILL.md 路径。配置文件的 `resident` 数组写**不 lazy（常驻）的例外工具**；`"resident": []` 表示无例外、全部 lazy。
+无任何配置文件时**默认全量 lazy**：除单入口 `omnify` 常驻外，全部已装工具（含 `read`、`bash` 等内置工具）按需加载；技能清单也不入系统提示词，由 omnify 检索并返回其 SKILL.md 路径。同时，会话启动会把系统提示词的 `rules`/`docs` 两节压缩成要点版（语义要点不变），技能清单替换为一行占位，进一步削减首请求 token。配置文件的 `resident` 数组写**不 lazy（常驻）的例外工具**；`"resident": []` 表示无例外、全部 lazy。
 
 ```jsonc
 // ~/.pi/lazy-tools.json

@@ -56,7 +56,7 @@ typebox: the extension imports typebox directly (the same one pi uses; it lives 
 
 ### Minimal config
 
-With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the single resident entry `omnify`; the skills roster stays out of the system prompt too and is reachable through omnify, which returns the matching SKILL.md paths. The config's `resident` array lists the exceptions (tools that stay always-on); `"resident": []` means no exceptions — everything is lazy.
+With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the single resident entry `omnify`; the skills roster stays out of the system prompt too and is reachable through omnify, which returns the matching SKILL.md paths. At session start the `rules`/`docs` sections of the system prompt are also compressed to their essentials (semantics preserved) and the skills roster is replaced by a one-line placeholder, trimming first-request tokens further. The config's `resident` array lists the exceptions (tools that stay always-on); `"resident": []` means no exceptions — everything is lazy.
 
 ```jsonc
 // ~/.pi/lazy-tools.json
