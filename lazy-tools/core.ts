@@ -14,19 +14,9 @@ export interface LazyList {
 	resident: string[];
 }
 
-export interface FilterResult {
-	allowed: string[];
-	rejected: string[];
-}
-
 export interface ValidationResult {
 	ok: boolean;
 	errors: string[];
-}
-
-export interface CanCallResult {
-	ok: boolean;
-	reason: string;
 }
 
 export interface StartupNoticeInput {
@@ -34,11 +24,6 @@ export interface StartupNoticeInput {
 	userConfigPath: string;
 	projectConfigPath: string;
 	effectiveConfigPath: string | null;
-}
-
-export interface LoadChallengeInput {
-	toolNames: string[]; // 将被加载的工具名
-	toolDescriptions: Record<string, string>; // 工具名 → description（来自 getAllTools）
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -74,35 +59,6 @@ export function mergeLazyConfigs(
 	return { resident: [] };
 }
 
-/**
- * Split requested tool names into allowed and rejected lists based on a
- * whitelist. Preserves first-seen order and deduplicates. Non-string entries
- * in either input are ignored.
- */
-export function filterAllowedTools(requested: unknown[], whitelist: unknown[]): FilterResult {
-	const whitelistSet = new Set(
-		whitelist.filter((item): item is string => typeof item === "string"),
-	);
-
-	const allowed: string[] = [];
-	const rejected: string[] = [];
-	const seen = new Set<string>();
-
-	for (const item of requested) {
-		if (typeof item !== "string") continue;
-		if (seen.has(item)) continue;
-		seen.add(item);
-
-		if (whitelistSet.has(item)) {
-			allowed.push(item);
-		} else {
-			rejected.push(item);
-		}
-	}
-
-	return { allowed, rejected };
-}
-
 function describeValue(value: unknown): string {
 	if (value === undefined) return "undefined";
 	if (value === null) return "null";
@@ -111,7 +67,6 @@ function describeValue(value: unknown): string {
 	if (Array.isArray(value)) return "array";
 	return typeof value;
 }
-
 function matchesType(value: unknown, type: string): boolean {
 	switch (type) {
 		case "string":
@@ -130,7 +85,6 @@ function matchesType(value: unknown, type: string): boolean {
 			return true;
 	}
 }
-
 function validateValue(
 	schema: unknown,
 	value: unknown,
@@ -246,56 +200,6 @@ export function selectEffectiveConfigPath(
 }
 
 /**
- * Check whether a lazy tool may be invoked through call_tool.
- *
- * - Must be in the whitelist.
- * - Must have been previously loaded (present in activatedSet).
- */
-export function canCall(
-	tool: string,
-	whitelist: string[],
-	activatedSet: Set<string>,
-): CanCallResult {
-	if (!whitelist.includes(tool)) {
-		return { ok: false, reason: `工具 "${tool}" 不在 lazy 名单中。` };
-	}
-	if (!activatedSet.has(tool)) {
-		return {
-			ok: false,
-			reason: `工具 "${tool}" 未激活；先 load_tools({ tools: ["${tool}"], confirm: true })。`,
-		};
-	}
-	return { ok: true, reason: "" };
-}
-
-/**
- * Build the two-step confirmation challenge text for load_tools.
- *
- * Lists each tool to be loaded with its description (or a fallback when
- * metadata is missing), states that this call has no side effects, warns that
- * the loaded tools will be activated and callable via call_tool, and spells out
- * the exact second-call shape with confirm: true.
- */
-export function buildLoadChallenge(input: LoadChallengeInput): string {
-	const lines: string[] = [];
-	lines.push("以下工具确认后将激活，可经 call_tool 调用；本次未加载或激活任何工具。");
-	lines.push("");
-	lines.push("唯用户主动要求方加载，确认前请核对。");
-	lines.push("");
-
-	for (const name of input.toolNames) {
-		const description = input.toolDescriptions[name] ?? "未找到工具元数据";
-		lines.push(`- ${name}: ${description}`);
-	}
-
-	lines.push("");
-	const toolsList = input.toolNames.map((name) => JSON.stringify(name)).join(", ");
-	lines.push(`确认请再调：load_tools({ tools: [${toolsList}], confirm: true })`);
-
-	return lines.join("\n");
-}
-
-/**
  * Build the startup notice text shown when a session starts.
  *
  * Lists the merged lazy tool names and states which configuration file is
@@ -326,4 +230,71 @@ export function buildStartupNotice(input: StartupNoticeInput): string {
 	}
 
 	return lines.join("\n");
+}
+
+export interface ToolInfoLike {
+	name: string;
+	description: string;
+}
+
+/** 中文高频虚词（2-gram 计分时剔除，避免噪声覆盖语义）。 */
+const CJK_STOPWORDS = new Set([
+	"一个", "两个", "什么", "怎么", "哪个", "哪些", "这个", "那个", "这些", "那些",
+	"想要", "希望", "需要", "可以", "能否", "帮忙", "帮我", "请帮", "请你", "请把",
+	"使用", "调用", "搜索", "找回", "查找", "通过", "完成", "执行", "进行", "然后",
+	"以及", "或者", "还是", "并且", "但是", "所以", "因为", "如果", "假如", "既然",
+	"我的", "你的", "我们", "你们", "他们", "自己", "咱们", "这里", "那里", "现在",
+	"自动", "一步", "直接", "先把", "先试", "试试", "尝试", "一下", "是否", "是否",
+	"做些", "做一", "的", "了", "把", "被", "于", "在", "至", "给", "从", "向",
+]);
+
+function ngramSet(text: string, n: number): string[] {
+	const out: string[] = [];
+	for (let i = 0; i + n <= text.length; i++) {
+		const g = text.slice(i, i + n);
+		if (!CJK_STOPWORDS.has(g)) out.push(g);
+	}
+	return out;
+}
+
+/**
+ * Rank candidate tools by relevance to a natural-language goal.
+ *
+ * Scoring (higher wins):
+ * - goal equals tool name: 10
+ * - goal or tool name contains the other: 6
+ * - goal appears in description verbatim: 5
+ * - each >=2-char space-separated word of goal found in description: +1
+ *
+ * Returns names with score > 0, best first. Empty goal yields no matches.
+ * Chinese goals rarely embed as substrings, so prefer the explicit `tool`
+ * param of omnify when the goal is a sentence, not a tool keyword.
+ */
+export function rankToolMatches(goal: string, toolInfos: ToolInfoLike[]): string[] {
+	const g = goal.trim().toLowerCase();
+	if (!g) return [];
+
+	// 中英文词元：整词（≥2 字符）或 2-gram 窗口。
+	const tokens = new Set<string>();
+	for (const w of g.split(/\W+/)) {
+		if (w.length >= 2) tokens.add(w);
+	}
+	for (const g2 of ngramSet(g, 2)) tokens.add(g2);
+
+	const scored = toolInfos
+		.map((t) => {
+			const name = t.name.toLowerCase();
+			const desc = t.description.toLowerCase();
+			let score = 0;
+			if (name === g) score += 10;
+			else if (name.includes(g) || g.includes(name)) score += 6;
+			if (desc.includes(g)) score += 5;
+			for (const w of tokens) {
+				if (desc.includes(w)) score += 1;
+			}
+			return { name: t.name, score };
+		})
+		.filter((s) => s.score > 0)
+		.sort((a, b) => b.score - a.score);
+	return scored.map((s) => s.name);
 }

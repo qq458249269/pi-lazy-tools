@@ -6,9 +6,7 @@
  *
  * Contract under test (no pi runtime, no typebox imports):
  *   mergeLazyConfigs(userCfg, projectCfg)                -> { resident: string[] }
- *   filterAllowedTools(requested, whitelist)             -> { allowed, rejected }
  *   validateParams(schema, params)                       -> { ok, errors }
- *   canCall(tool, whitelist, activatedSet)               -> { ok, reason }
  *   buildStartupNotice(input)                            -> string
  */
 import { describe, it } from "node:test";
@@ -16,14 +14,11 @@ import assert from "node:assert/strict";
 
 import {
 	mergeLazyConfigs,
-	filterAllowedTools,
 	validateParams,
-	canCall,
 	selectEffectiveConfigPath,
 	buildStartupNotice,
-	buildLoadChallenge,
+	rankToolMatches,
 	StartupNoticeInput,
-	LoadChallengeInput,
 } from "../lazy-tools/core.ts";
 
 // ===== Shared fixtures =====
@@ -159,39 +154,6 @@ describe("mergeLazyConfigs", () => {
 });
 
 // ===== filterAllowedTools =====
-
-describe("filterAllowedTools", () => {
-	it("should split requested tools into allowed and rejected by whitelist membership", () => {
-		assert.deepEqual(
-			filterAllowedTools(["load_tools", "revive_subagent", "call_tool"], ["load_tools", "call_tool"]),
-			{ allowed: ["load_tools", "call_tool"], rejected: ["revive_subagent"] },
-		);
-	});
-
-	it("should reject everything when the whitelist is empty", () => {
-		assert.deepEqual(filterAllowedTools(["a", "b"], []), { allowed: [], rejected: ["a", "b"] });
-	});
-
-	it("should return empty lists for an empty request", () => {
-		assert.deepEqual(filterAllowedTools([], ["a"]), { allowed: [], rejected: [] });
-	});
-
-	it("should dedupe requested tools preserving first-seen order", () => {
-		assert.deepEqual(filterAllowedTools(["a", "b", "a", "c", "b"], ["a", "b"]), {
-			allowed: ["a", "b"],
-			rejected: ["c"],
-		});
-	});
-
-	it("should ignore non-string entries in requested and whitelist", () => {
-		assert.deepEqual(filterAllowedTools(["a", 1, null] as string[], ["a", 42] as string[]), {
-			allowed: ["a"],
-			rejected: [],
-		});
-	});
-});
-
-// ===== validateParams: OpenAaaS-style schema =====
 
 describe("validateParams (OpenAaaS-style schema)", () => {
 	it("should accept a minimal valid params with only action", () => {
@@ -398,39 +360,6 @@ describe("validateParams (review-driven regressions)", () => {
 
 // ===== canCall =====
 
-describe("canCall", () => {
-	it("should allow a tool that is whitelisted and activated", () => {
-		const result = canCall("revive_subagent", ["revive_subagent"], new Set(["revive_subagent"]));
-		assert.equal(result.ok, true);
-	});
-
-	it("should reject a tool not in the whitelist even when already activated", () => {
-		const result = canCall("evil", ["revive_subagent"], new Set(["evil"]));
-		assert.equal(result.ok, false);
-		assert.match(result.reason, /lazy 名单/);
-	});
-
-	it("should reject a whitelisted tool that has not been activated", () => {
-		const result = canCall("revive_subagent", ["revive_subagent"], new Set());
-		assert.equal(result.ok, false);
-		assert.match(result.reason, /激活/);
-		assert.match(result.reason, /confirm: true/, "未激活提示应包含新调用形状 confirm: true");
-	});
-
-	it("should reject a tool neither whitelisted nor activated", () => {
-		const result = canCall("evil", ["good"], new Set(["other"]));
-		assert.equal(result.ok, false);
-		assert.match(result.reason, /lazy 名单/);
-	});
-
-	it("should reject an empty tool name", () => {
-		const result = canCall("", ["revive_subagent"], new Set(["revive_subagent"]));
-		assert.equal(result.ok, false);
-	});
-});
-
-// ===== selectEffectiveConfigPath（新契约） =====
-
 describe("selectEffectiveConfigPath", () => {
 	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
 	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
@@ -614,116 +543,32 @@ describe("buildStartupNotice (新契约)", () => {
 
 // ===== buildLoadChallenge（新契约：两步确认） =====
 
-describe("buildLoadChallenge (新契约)", () => {
-	// 列出所有工具名与描述（多项）
-	it("should list every tool name with its description", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent", "openaas"],
-			toolDescriptions: {
-				revive_subagent: "恢复/继续之前的 subagent 会话。",
-				openaas: "向远程 OpenAaaS Agent 服务提交任务。",
-			},
-		});
+// ===== rankToolMatches（omnify 候选定位） =====
 
-		assert.ok(text.includes("revive_subagent"), `challenge 应列出 revive_subagent; got: ${text}`);
-		assert.ok(text.includes("openaas"), `challenge 应列出 openaas; got: ${text}`);
-		assert.ok(
-			text.includes("恢复/继续之前的 subagent 会话。"),
-			`challenge 应包含 revive_subagent 的 description; got: ${text}`,
-		);
-		assert.ok(
-			text.includes("向远程 OpenAaaS Agent 服务提交任务。"),
-			`challenge 应包含 openaas 的 description; got: ${text}`,
-		);
+describe("rankToolMatches", () => {
+	const TOOLS = [
+		{ name: "fake_discover", description: "Fake discover tool for tests (OpenAaaS-like)." },
+		{ name: "load_proxy", description: "载入 lazy 工具之使用说明" },
+		{ name: "tool_caller", description: "调用已激活之 lazy 工具" },
+	];
+
+	it("should rank an exact tool-name goal first", () => {
+		const hits = rankToolMatches("fake_discover", TOOLS);
+		assert.equal(hits[0], "fake_discover");
+		assert.ok(hits.length >= 1);
 	});
 
-	// 包含"未加载任何工具/零副作用"声明语义
-	it("should declare that nothing was loaded or activated (zero side effects)", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent"],
-			toolDescriptions: { revive_subagent: "恢复/继续之前的 subagent 会话。" },
-		});
-
-		assert.ok(
-			text.includes("没有加载或激活任何工具") ||
-				text.includes("未加载") ||
-				text.includes("零副作用") ||
-				text.includes("本次调用不会加载") ||
-				text.includes("本次调用未加载"),
-			`challenge 应明确声明本次调用未加载/激活任何工具（零副作用）; got: ${text}`,
-		);
+	it("should match a Chinese goal against descriptions via 2-grams, ignoring stopwords", () => {
+		const hits = rankToolMatches("想调用一个工具", TOOLS);
+		assert.ok(hits.includes("tool_caller"), `中文目标应命中调用类工具; got: ${JSON.stringify(hits)}`);
 	});
 
-	// 包含警告语义（激活 + call_tool 可调用）
-	it("should warn that loaded tools become activated and callable via call_tool", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent"],
-			toolDescriptions: { revive_subagent: "恢复/继续之前的 subagent 会话。" },
-		});
-
-		assert.ok(text.includes("激活"), `challenge 应警告工具将被激活; got: ${text}`);
-		assert.ok(text.includes("call_tool"), `challenge 应提示可通过 call_tool 调用; got: ${text}`);
+	it("should return no hits for an unrelated goal", () => {
+		assert.deepEqual(rankToolMatches("量子物理引力波", TOOLS), []);
 	});
 
-	// 包含第二次调用形状（"confirm: true" 与工具名）
-	it("should spell out the exact second-call shape with confirm:true", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent", "openaas"],
-			toolDescriptions: {
-				revive_subagent: "恢复/继续之前的 subagent 会话。",
-				openaas: "向远程 OpenAaaS Agent 服务提交任务。",
-			},
-		});
-
-		assert.ok(text.includes("confirm: true"), `challenge 应包含第二次调用形状 confirm: true; got: ${text}`);
-		assert.ok(text.includes("revive_subagent"), `第二次调用形状应含工具名 revive_subagent; got: ${text}`);
-		assert.ok(text.includes("openaas"), `第二次调用形状应含工具名 openaas; got: ${text}`);
-	});
-
-	// 描述缺失时标注未找到
-	it("should mark tools without metadata as not found", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent", "ghost_tool"],
-			toolDescriptions: { revive_subagent: "恢复/继续之前的 subagent 会话。" },
-		});
-
-		assert.ok(text.includes("未找到工具元数据"), `challenge 应对缺失描述标注"未找到工具元数据"; got: ${text}`);
-	});
-
-	// 空描述映射时的表现
-	it("should mark all tools as not found when the description map is empty", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent", "openaas"],
-			toolDescriptions: {},
-		});
-
-		assert.ok(text.includes("未找到工具元数据"), `challenge 应对所有工具标注"未找到工具元数据"; got: ${text}`);
-	});
-
-	// 新契约：挑战文本含「用户主动要求」提示（约束层：仅在用户主动要求时才加载工具）
-	it("should include a user-explicitly-asks constraint in the challenge text", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent"],
-			toolDescriptions: { revive_subagent: "恢复/继续之前的 subagent 会话。" },
-		});
-
-		// 锁定的措辞：文本须同时含"用户"与"主动要求"（或"用户主动"）
-		assert.ok(
-			(text.includes("用户") && text.includes("主动要求")) || text.includes("用户主动"),
-			`challenge 应含「仅在用户主动要求时才加载工具」类提示; got: ${text}`,
-		);
-	});
-
-	// 零副作用再锁：challenge 文本不含 buildLoadResult 专属前缀「已加载」
-	it("should not include the buildLoadResult prefix （已加载） in the challenge text", () => {
-		const text = buildLoadChallenge({
-			toolNames: ["revive_subagent"],
-			toolDescriptions: { revive_subagent: "恢复/继续之前的 subagent 会话。" },
-		});
-
-		assert.ok(
-			!text.includes("已加载"),
-			`challenge 分支不得拼使用说明正文（不得含"已加载"前缀）; got: ${text}`,
-		);
+	it("should return no hits for an empty or whitespace goal", () => {
+		assert.deepEqual(rankToolMatches("", TOOLS), []);
+		assert.deepEqual(rankToolMatches("   ", TOOLS), []);
 	});
 });

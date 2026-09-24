@@ -1,15 +1,16 @@
 /**
- * Lazy Tools Extension
+ * Lazy Tools Extension — omnify 单入口
  *
- * Keeps configured tools out of the LLM-visible active set while keeping them
- * registered in the pi runtime. They can be loaded on demand as plain-text
- * instructions via `load_tools` and then invoked through `call_tool`.
+ * 把配置的低频工具保留注册但移出 LLM 可见的 active 集；唯常驻入口 `omnify`
+ * 一步完成：搜索候选 → 返回参数要求（schema-first, 无 args 时）→ 校验调用
+ * （有 args 时）。未匹配则返回全部工具名录 + 技能命中（SKILL.md 路径），
+ * 并建议退回 bash/read/编辑 等常规手段。
  *
- * Configuration is read from two levels, with project config overriding user config.
- *
+ * 配置为 resident 例外（不 lazy、留在初始 active 集）：
  *   User:    ~/.pi/lazy-tools.json
  *   Project: <cwd>/.pi/lazy-tools.json
- *   Format:  { "resident": string[] }   # 不 lazy（常驻）的例外；无配置则全量 lazy
+ *   Format:  { "resident": string[] }
+ * 无配置则除 omnify 外全量 lazy。
  */
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -21,11 +22,9 @@ import * as fs from "node:fs";
 import {
 	mergeLazyConfigs,
 	selectEffectiveConfigPath,
-	filterAllowedTools,
 	validateParams,
-	canCall,
 	buildStartupNotice,
-	buildLoadChallenge,
+	rankToolMatches,
 	type LazyConfig,
 } from "./lazy-tools/core.ts";
 
@@ -36,9 +35,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 const jiti = createJiti(import.meta.url);
 
 const CONFIG_NAME = "lazy-tools.json";
-const LOADER_NAME = "load_tools";
-const CALLER_NAME = "call_tool";
-const SKILL_SEARCH_NAME = "skill_search";
+const OMNIFY_NAME = "omnify";
 
 interface SkillMeta {
 	name: string;
@@ -46,15 +43,8 @@ interface SkillMeta {
 	filePath: string;
 }
 
-/** 技不内联于系统提示，改由 skill_search 检索。 */
-const SKILLS_NOTE = "技能清单不列于此。唯用户明请用技时，调 skill_search 检索，再读所返 SKILL.md。";
-
-interface ConfigReadResult {
-	requested: string[];
-	accepted: string[];
-	rejected: string[];
-	confirmRequired?: boolean;
-}
+/** 技与懒工具皆不内联，由 omnify 检索；skill 命中的动作是 read 其 SKILL.md。 */
+const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按其命中结果 read 对应 SKILL.md。";
 
 /**
  * Read a single lazy-tools config file. Returns null if the file is missing or
@@ -113,9 +103,8 @@ function createFakePi(realPi: ExtensionAPI, captured: ToolDefinition[]): Extensi
 
 /**
  * Re-run the source extension module to capture the ToolDefinition for a given
- * tool name. Successful lookups are memoized by (sourcePath, name) so the
- * target extension factory is only replayed once per tool; failures are not
- * cached and may be retried.
+ * tool name. Successful lookups are memoized by (sourcePath, name); failures
+ * are not cached and may be retried.
  */
 async function findToolDefinition(sourcePath: string, name: string, realPi: ExtensionAPI): Promise<ToolDefinition | undefined> {
 	const cacheKey = `${sourcePath}#${name}`;
@@ -147,189 +136,188 @@ async function findToolDefinition(sourcePath: string, name: string, realPi: Exte
 	}
 }
 
-const LoadToolsParams = Type.Object({
-	tools: Type.Array(Type.String(), {
-		description: "待载入之 lazy 工具名。",
-	}),
-	confirm: Type.Optional(Type.Boolean({
-		description: "true 方载入；缺省只返挑战，不载入。",
-	})),
+const OmnifyParams = Type.Object({
+	goal: Type.String({ description: "目标自然语言描述。" }),
+	args: Type.Optional(
+		Type.Record(Type.String(), Type.Unknown(), {
+			description: "目标工具参数；缺省即 schema-first。",
+		}),
+	),
+	tool: Type.Optional(
+		Type.String({
+			description: "显式工具名，跳过搜索。",
+		}),
+	),
 });
 
-type LoadToolsParams = Static<typeof LoadToolsParams>;
+type OmnifyParams = Static<typeof OmnifyParams>;
 
-const CallToolParams = Type.Object({
-	tool: Type.String({ description: "目标 lazy 工具名。" }),
-	params: Type.Record(Type.String(), Type.Unknown(), {
-		description: "透传目标工具之参数。",
-	}),
-});
-
-type CallToolParams = Static<typeof CallToolParams>;
-
-function buildLoadResult(requested: string[], accepted: string[], rejected: string[], pi: ExtensionAPI): string {
-	const allTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-	const lines: string[] = [];
-
-	if (accepted.length > 0) {
-		lines.push(`已加载 ${accepted.length} 个工具的使用说明：${accepted.join(", ")}`);
-	}
-	if (rejected.length > 0) {
-		lines.push(`拒绝（不在 lazy 名单中）：${rejected.join(", ")}`);
-	}
-
-	for (const name of accepted) {
-		const tool = allTools.get(name);
-		lines.push("");
-		lines.push(`## ${name}`);
-		if (!tool) {
-			lines.push("未找到工具元数据（可能尚未注册）。");
-			continue;
+/**
+ * Schema 摘要（schema-first 用）：字段 + 类型/枚举 + 必填性，省略其余细节。
+ * 完整 schema 只出现在失败明细里（两级披露：摘要够补参，精确值失败统底）。
+ */
+function summarizeSchema(schema: unknown): string {
+	const s = isObject(schema) ? schema : {};
+	const props = isObject(s.properties) ? (s.properties as Record<string, unknown>) : {};
+	const required = Array.isArray(s.required) ? (s.required as string[]) : [];
+	const parts = Object.entries(props).map(([key, sub]) => {
+		const subObj = isObject(sub) ? sub : {};
+		let type = typeof subObj.type === "string" ? (subObj.type as string) : "?";
+		if (Array.isArray(subObj.enum)) type += `[${(subObj.enum as unknown[]).join("|")}]`;
+		return `${key}:${type}${required.includes(key) ? "!" : "?"}`;
+	});
+	if (parts.length === 0) {
+		if (s.type === "array" && isObject(s.items)) {
+			const itemsType =
+				isObject(s.items) && typeof (s.items as Record<string, unknown>).type === "string"
+					? ((s.items as Record<string, unknown>).type as string)
+					: "any";
+			return `array<${itemsType}>`;
 		}
-		lines.push(`Description: ${tool.description}`);
-		lines.push("Parameters JSON Schema:");
-		lines.push(JSON.stringify(tool.parameters, null, 2));
-		if (tool.promptGuidelines && tool.promptGuidelines.length > 0) {
-			lines.push("Guidelines:");
-			for (const guideline of tool.promptGuidelines) {
-				lines.push(`- ${guideline}`);
-			}
-		}
+		return (typeof s.type === "string" ? s.type : "any") as string;
 	}
+	return `{ ${parts.join(", ")} }`;
+}
 
-	return lines.join("\n") || "没有请求任何工具。";
+/** 目标与技能清单的粗略匹配（skill 不是工具：仅返路径，不动手执行）。 */
+function matchSkills(goal: string, skills: SkillMeta[]): SkillMeta[] {
+	const q = goal.toLowerCase().trim();
+	if (!q) return [];
+	const words = q.split(/\W+/).filter((w) => w.length >= 2);
+	return skills.filter((s) => {
+		const hay = `${s.name} ${s.description}`.toLowerCase();
+		if (hay.includes(q)) return true;
+		return words.some((w) => hay.includes(w));
+	});
 }
 
 export default function (pi: ExtensionAPI) {
 	let lazyNames: string[] = [];
 	let lazySet = new Set<string>();
-	const activated = new Set<string>();
 	let skills: SkillMeta[] = [];
 
+	const renderToolSpec = (name: string, description: string, schema: object): string =>
+		`- ${name}
+  用途：${description}
+  参数：${summarizeSchema(schema)}`;
+
+	const renderSkillHits = (goal: string): string => {
+		if (goal.trim().length === 0) return "";
+		const hits = matchSkills(goal, skills);
+		if (hits.length === 0) return "";
+		return (
+			"\n\n匹配到的技能（skill 非工具：请 read 其 SKILL.md 取用法）：\n" +
+			hits.map((s) => `- ${s.name}: ${s.description}（${s.filePath}）`).join("\n")
+		);
+	};
+
+	// 全能入口：四合一。搜索→(schema-first 返参数摘要 | 校验执行)，未及则名录+技能。
 	pi.registerTool({
-		name: LOADER_NAME,
-		label: "Load Tools",
-		description: "lazy 工具先经 load_tools 取用法，再由 call_tool 调用。",
-		promptSnippet: "先 load_tools 取用法，后 call_tool 调用之。",
+		name: OMNIFY_NAME,
+		label: "Omnify",
+		description:
+			"按 goal 搜索并调用 lazy 工具/技能：无 args 返候选参数摘要；有 args 校验即执行；未匹配返名录与技能路径。tool 显式指名，避开搜索。",
+		promptSnippet: "想完成某事而不知用何工具/技能时，先试 omnify。",
 		promptGuidelines: [
-			"未激活者先 load_tools 取用法。",
-			"已激活者以 call_tool 调用。",
-			"唯用户主动要求方可 load_tools，勿自发。",
+			"无 args：返候选参数要求，补 args 重试。",
+			"失败：按明细补参/指名重试，或退常规手段。",
 		],
-		parameters: LoadToolsParams,
-
-		async execute(_toolCallId, params) {
-			const requested = [...new Set(params.tools)];
-			const { allowed: accepted, rejected } = filterAllowedTools(requested, lazyNames);
-
-			// a. 没有请求任何工具：保持原有行为，不进确认门。
-			if (requested.length === 0) {
-				const text = buildLoadResult(requested, accepted, rejected, pi);
-				return {
-					content: [{ type: "text", text }],
-					details: { requested, accepted, rejected } as ConfigReadResult,
-				};
-			}
-
-			// b. 请求的工具全部不在 lazy 名单：直接返回拒绝结果，不进确认门。
-			if (accepted.length === 0) {
-				const text = buildLoadResult(requested, accepted, rejected, pi);
-				return {
-					content: [{ type: "text", text }],
-					details: { requested, accepted, rejected } as ConfigReadResult,
-				};
-			}
-
-			// c. 有合法工具待加载但 confirm 不为 true：返回挑战文本，零副作用。
-			if (params.confirm !== true) {
-				const toolDescriptions: Record<string, string> = {};
-				for (const tool of pi.getAllTools()) {
-					if (typeof tool.name === "string" && typeof tool.description === "string") {
-						toolDescriptions[tool.name] = tool.description;
-					}
-				}
-				const text = buildLoadChallenge({ toolNames: accepted, toolDescriptions });
-				return {
-					content: [{ type: "text", text }],
-					details: { requested, accepted, rejected, confirmRequired: true } as ConfigReadResult,
-				};
-			}
-
-			// d. confirm === true：执行实际加载，将工具加入 activated 集合并返回使用说明。
-			for (const name of accepted) {
-				activated.add(name);
-			}
-
-			const text = buildLoadResult(requested, accepted, rejected, pi);
-			return {
-				content: [{ type: "text", text }],
-				details: { requested, accepted, rejected } as ConfigReadResult,
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: CALLER_NAME,
-		label: "Call Tool",
-		description: "以 call_tool 调用已激活之 lazy 工具，params 透传其参。",
-		promptSnippet: "仅可调已由 load_tools 激活之 lazy 工具。",
-		promptGuidelines: ["先经 load_tools 激活，后以 call_tool 调用。"],
-		parameters: CallToolParams,
+		parameters: OmnifyParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const name = params.tool;
+			const explicit = typeof params.tool === "string" && params.tool.length > 0;
+			const hasArgs = params.args !== undefined;
+			const allTools = pi
+				.getAllTools()
+				.filter((t) => typeof t.name === "string" && typeof t.description === "string");
+			const toolMap = new Map(allTools.map((t) => [t.name, t]));
 
-			const permission = canCall(name, lazyNames, activated);
-			if (!permission.ok) {
-				throw new Error(permission.reason);
+			const candidates = explicit
+				? [params.tool as string]
+				: rankToolMatches(params.goal, allTools).slice(0, 5);
+			// omnify 自身不入候选（防自调）。
+			const matched = candidates.filter((name) => toolMap.has(name) && name !== OMNIFY_NAME);
+
+			// a. 零匹配：全部工具名录 + 技能命中，引导指名或退常规。
+			if (matched.length === 0) {
+				const roster = [...toolMap.entries()].map(([n, t]) => `- ${n}: ${t.description}`).join("\n");
+				const text =
+					`未找到与目标相关之工具/技能。可用工具：\n${roster}${renderSkillHits(params.goal)}\n` +
+					(explicit
+						? `工具 "${params.tool}" 不存在。`
+						: "请以 tool 参数指名其一补 args 重试，或以 bash/read/编辑 等常规手段完成。");
+				return {
+					content: [{ type: "text", text }],
+					details: { ok: false, matched: [], reasons: [] },
+				};
 			}
 
-			const toolInfo = pi.getAllTools().find((tool) => tool.name === name);
-			if (!toolInfo) {
-				throw new Error(`找不到工具 "${name}" 的注册信息。`);
+			// b. 无 args：schema-first。返候选参数要求，供模型补参重试（零执行副作用）。
+			if (!hasArgs) {
+				const need = matched
+					.map((name) => {
+						const t = toolMap.get(name)!;
+						return renderToolSpec(name, t.description, t.parameters as object);
+					})
+					.join("\n");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `匹配到候选工具，请按其参数要求补 args 后重试：\n${need}${renderSkillHits(params.goal)}`,
+						},
+					],
+					details: { ok: false, phase: "need-args", matched },
+				};
 			}
 
-			const schema = toolInfo.parameters as object;
-			const validation = validateParams(schema, params.params);
-			if (!validation.ok) {
-				throw new Error(
-					`参数校验失败，未执行 "${name}":\n` + validation.errors.map((e) => `- ${e}`).join("\n"),
-				);
+			// c. 有 args：逐候选校验并试调，成功即返。
+			const reasons: string[] = [];
+			for (const name of matched) {
+				const info = toolMap.get(name)!;
+				try {
+					const validation = validateParams(info.parameters, params.args);
+					if (!validation.ok) {
+						reasons.push(
+							`- ${name}: 参数不符（${validation.errors.join("; ")}）\n  参数要求：${JSON.stringify(info.parameters)}`,
+						);
+						// 指名场景：即返该工具要求，勿代为猜试其他工具。
+						if (explicit) break;
+						continue;
+					}
+
+					const sourcePath = info.sourceInfo?.path;
+					if (!sourcePath) throw new Error("缺少来源路径");
+					const definition = await findToolDefinition(sourcePath, name, pi);
+					if (!definition) throw new Error("执行定义加载失败");
+
+					const result = await definition.execute(
+						toolCallId,
+						params.args as never,
+						signal,
+						onUpdate,
+						ctx,
+					);
+					return {
+						content: result.content,
+						details: { ok: true, tool: name, ...(result?.details ?? {}) },
+					};
+				} catch (err) {
+					reasons.push(`- ${name}: ${err instanceof Error ? err.message : String(err)}`);
+				}
 			}
 
-			const sourcePath = toolInfo.sourceInfo?.path;
-			if (!sourcePath) {
-				throw new Error(`工具 "${name}" 缺少来源路径，无法调用。`);
-			}
-
-			const definition = await findToolDefinition(sourcePath, name, pi);
-			if (!definition) {
-				throw new Error(`无法从 ${sourcePath} 加载工具 "${name}" 的执行定义。`);
-			}
-
-			return await definition.execute(toolCallId, params.params as never, signal, onUpdate, ctx);
-		},
-	});
-
-	pi.registerTool({
-		name: SKILL_SEARCH_NAME,
-		label: "Search Skills",
-		description: "以关键词或技名寻技，返名、述、SKILL.md 路径。",
-		promptSnippet: "寻技能，返 SKILL.md 路径。",
-		parameters: Type.Object({
-			query: Type.String({ description: "检索之词或技名。" }),
-		}),
-
-		async execute(_toolCallId, params) {
-			const query = params.query.toLowerCase();
-			const hits = skills.filter(
-				(s) => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query),
-			);
-			const text =
-				hits.length === 0
-					? "未找到匹配之技能。"
-					: hits.map((s) => `- ${s.name}: ${s.description}（SKILL.md: ${s.filePath}）`).join("\n");
-			return { content: [{ type: "text", text }], details: {} };
+			const text = [
+				`omnify 尝试 ${matched.length} 个候选工具均未成功：`,
+				...reasons,
+				explicit
+					? "请按上方参数要求补参重试，或以常规手段完成。"
+					: "请以常规手段（bash/read/编辑）完成，或以 tool 参数显式指名工具重试。",
+			].join("\n");
+			return {
+				content: [{ type: "text", text: text + renderSkillHits(params.goal) }],
+				details: { ok: false, matched, reasons },
+			};
 		},
 	});
 
@@ -364,8 +352,8 @@ export default function (pi: ExtensionAPI) {
 				userConfigPath,
 				projectConfigPath,
 			);
-			// 无有效配置 → 例外为空：全量 lazy（唯三常驻）；名单为 session_start 时点快照，此后注册的工具默认常驻
-			const resident = new Set([LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME]);
+			// 无有效配置 → 例外仅 omnify：全量 lazy；名单为 session_start 时点快照
+			const resident = new Set([OMNIFY_NAME]);
 			if (effectiveConfigPath !== null) {
 				for (const name of mergeLazyConfigs(userConfig, projectConfig).resident) {
 					resident.add(name);
@@ -376,7 +364,6 @@ export default function (pi: ExtensionAPI) {
 				.map((tool) => tool.name)
 				.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
-			activated.clear();
 			definitionCache.clear();
 			const notice = buildStartupNotice({
 				toolNames: lazyNames,
@@ -387,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 
 			const active = pi.getActiveTools();
 			const filtered = active.filter((toolName) => !lazySet.has(toolName));
-			const initial = [...new Set([...filtered, LOADER_NAME, CALLER_NAME, SKILL_SEARCH_NAME])];
+			const initial = [...new Set([...filtered, OMNIFY_NAME])];
 			pi.setActiveTools(initial);
 
 			if (event?.reason === "startup") {

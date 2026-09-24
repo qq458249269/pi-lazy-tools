@@ -8,7 +8,7 @@ Let low-frequency tools load on demand, the way Skills do, inside pi.
 
 The tools the main agent can call, and the multi-kilobyte manuals attached to each of them, largely decide what it can do. Those manuals appear in full on every request, including the ones used in maybe 5% of sessions: the agent has to re-read all of them every round to find what the current task actually needs. We worked out this "clean context" philosophy at the subagent level with [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation), where the main agent only assigns work and never touches task details. The tool dimension has the same problem left: low-frequency definitions are present every round.
 
-Skills solve the same problem with progressive disclosure: load only what is needed. pi-lazy-tools applies that idea to tools. Registration stays as-is (the `--tools` whitelist and pi runtime metadata are untouched); at session start every non-resident tool (all installed tools by default) is removed from the LLM-visible active set, granular to individual tools, so a single extension can be partially hidden. When one is needed, `load_tools` injects its usage instructions as plain text and `call_tool` executes on its behalf; the actual execution is always the target extension's own `execute`. After the removal, the context holds only the tools the agent actually uses; attention stops being spent on low-frequency manuals. Because the tools field and the system prompt never change during a session, lazy loading never invalidates the cache, on any model (argument in [How it works](#how-it-works)).
+Skills solve the same problem with progressive disclosure: load only what is needed. pi-lazy-tools applies that idea to tools. Registration stays as-is (the `--tools` whitelist and pi runtime metadata are untouched); at session start every non-resident tool (all installed tools by default) is removed from the LLM-visible active set, granular to individual tools, so a single extension can be partially hidden. When one is needed, the single resident entry `omnify` searches, returns the usage requirements (schema-first) and executes on its behalf in one step (four-in-one: the former load_tools / call_tool / skill_search are merged in); the actual execution is always the target extension's own `execute`. After the removal, the context holds only the tools the agent actually uses; attention stops being spent on low-frequency manuals. Because the tools field and the system prompt never change during a session, lazy loading never invalidates the cache, on any model (argument in [How it works](#how-it-works)).
 
 ## Table of contents
 
@@ -50,13 +50,13 @@ Three more steps after installation:
 
 1. Write the config (see [Minimal config](#minimal-config); without one, everything is lazy by default)
 2. Keep lazy tools in the `--tools` whitelist of the launch command (registration and hiding are two separate things, see [Configuration](#configuration))
-3. Start a new session (extensions load at session start; an old session has no `load_tools`)
+3. Start a new session (extensions load at session start; an old session has no `omnify`)
 
 typebox: the extension imports typebox directly (the same one pi uses; it lives in the root node_modules).
 
 ### Minimal config
 
-With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the resident `load_tools`, `call_tool`, `skill_search`; the skills roster stays out of the system prompt too and is reachable only via `skill_search`. The config's `resident` array lists the exceptions (tools that stay always-on); `"resident": []` means no exceptions — everything is lazy.
+With no configuration file, the plugin **lazies everything by default**: every installed tool (including built-ins like `read`, `bash`) is loaded on demand except the single resident entry `omnify`; the skills roster stays out of the system prompt too and is reachable through omnify, which returns the matching SKILL.md paths. The config's `resident` array lists the exceptions (tools that stay always-on); `"resident": []` means no exceptions — everything is lazy.
 
 ```jsonc
 // ~/.pi/lazy-tools.json
@@ -71,61 +71,52 @@ Putting the file at `<cwd>/.pi/lazy-tools.json` scopes it to the current project
 
 ### Picking tools to lazy-load
 
-Everything is lazy by default, so the criteria below invert: keep the `resident` exceptions to hot, must-have tools — every other use would otherwise cost an extra `load_tools` round-trip.
+Everything is lazy by default, so the criteria below invert: keep the `resident` exceptions to hot, must-have tools — every other use would otherwise cost an extra omnify search / re-call round-trip.
 
-Go through the tools registered in pi's tool list: anything with a long description and a sizeable parameter schema, yet used once every few days, is a candidate. Two criteria: low frequency (days between uses) and simple parameters (one or two fields per call). Keep hot tools out of the lazy set (put them in `resident`); the extra `load_tools` round-trip per use is a net loss.
+Go through the tools registered in pi's tool list: anything with a long description and a sizeable parameter schema, yet used once every few days, is a candidate. Two criteria: low frequency (days between uses) and simple parameters (one or two fields per call). Keep hot tools out of the lazy set (put them in `resident`); the extra omnify search / re-call round-trip per use is a net loss.
 
 ### Usage example
 
-Tell the main agent: "activate deploy_tool and deploy the current version to staging". The flow has three steps:
+Tell the main agent: "deploy the current version to staging". One omnify call:
 
-1. `load_tools({ tools: ["deploy_tool"] })`
-   zero side effects; returns only a challenge text and activates nothing. The challenge lists each tool's name and description, states that this call loaded or activated nothing, warns that after confirmation the tools will be activated (per-session) and callable via call_tool, and spells out the exact second-call shape
-2. `load_tools({ tools: ["deploy_tool"], confirm: true })`
-   activates the tools for real and returns the usage instructions: description, parameter JSON Schema, guidelines
-3. `call_tool({ tool: "deploy_tool", params: { env: "staging" } })`
-   deploy_tool executes for real, the result is passed through unchanged
+```
+omnify({ goal: "deploy the current version to staging", args: { env: "staging" } })
+```
 
-The second step must rest on an explicit user request to load: naming "activate deploy_tool" counts. When the user names no tool, the main agent must not load a tool merely because it judged the task needs one; it should ask the user first.
+omnify searches candidate tools by the goal. Without `args` it returns the matching
+tools' parameter JSON Schemas (schema-first); fill in `args` and retry. With `args`
+it validates and executes directly, returning the result on success. When the tool
+name is unknown, call `omnify({ goal })` first to list candidates, then supply args.
 
 ## Usage
 
-### load_tools: on-demand usage injection
+### omnify: four-in-one search-and-call
 
-`load_tools` has a two-step confirmation gate: the `confirm` parameter is an optional boolean, defaulting to false. A call without `confirm: true` has zero side effects: it registers nothing, activates nothing, and only returns a challenge text (with `confirmRequired: true` in details):
+omnify is the single resident entry; the former load_tools / call_tool / skill_search
+are merged into it:
 
-```
-Load confirmation: the tools below will be activated after confirmation and become callable via call_tool. This call loaded or activated nothing.
+| Scenario | Behavior |
+| --- | --- |
+| `goal` matches nothing | Returns the full tool roster + skill hits (SKILL.md paths); suggests falling back to regular means |
+| matched + no `args` | schema-first: returns the candidates' parameter JSON Schemas; retry with args |
+| matched + `args` | validates against the JSON Schema, then executes; returns the result on success |
+| explicit `tool` | skips search and evaluates only that tool; stops on invalid args instead of guessing other tools |
 
-Note: only load tools when the user explicitly asks for them; before confirming the load, make sure this is something the user explicitly asked for.
+Matching ranks exact/contained tool names first, then the intersection of the goal's
+tokens (English words + Chinese bigrams minus stopwords) with descriptions; the top 5
+candidates are tried in order until one succeeds. Execution replays the target
+extension's factory via a fake pi (createFakePi) to capture its ToolDefinition (with
+the real execute), memoized by `${sourcePath}#${name}` (one factory replay per tool per
+session), then calls `definition.execute` with the original params, signal, onUpdate
+and ctx; the result passes through unchanged.
 
-- deploy_tool: <description>
+Schema validation supports the subset type / required / enum / pattern / properties /
+additionalProperties / items; invalid params return field-path errors (e.g.
+`action: expected one of [discover, submit], got "nope"`) and the target execute never
+runs.
 
-To confirm the load, call again: load_tools({ tools: ["deploy_tool"], confirm: true })
-```
-
-The challenge lists each tool to be loaded with its name and description, states that nothing was loaded or activated by this call, warns that after confirmation the tools will be activated (per-session) and callable via call_tool, and finally spells out the exact second-call shape. The same "only on explicit user request" constraint is written into load_tools' own promptGuidelines: `"Only load tools when the user explicitly asks for them; never load on your own initiative."`
-
-Only a second call with `confirm: true` actually adds the tools to the per-session activated set and reads the target tool's description, parameter JSON Schema (pretty-printed) and promptGuidelines from `getAllTools()` (runtime metadata available after registration, independent of active state), assembling them into a Markdown text block appended to the message stream as a tool_result. The model reads the usage like a document. The tools field and the system prompt are never touched.
-
-Edge cases: an empty request returns a "no tools requested" notice directly; a request where every tool is off the lazy list returns a direct rejection. Neither case enters the confirmation gate, so no confirmRequired appears.
-
-Whitelist filtering: requesting a tool outside the list returns "Rejected (not in the lazy list)"; a tool inside the list but not registered returns "tool metadata not found" (usually the tool is missing from the `--tools` whitelist, see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
-
-### call_tool: proxied invocation
-
-Four gates; the target tool is never touched if any of them fails:
-
-1. Whitelist check: the target must be listed in lazy-tools.json
-2. Activation gate: it must first be activated via `load_tools({ tools: [...], confirm: true })` (activation is per-session memory, cleared at session start)
-3. JSON Schema pre-validation: supports the subset type / required / enum / pattern / properties / additionalProperties / items; invalid input returns field-path errors (e.g. `role: expected one of [admin, member], got "foo"`), and the target execute is not run
-4. Replay-capture execute: run the target extension's factory with a fake pi (createFakePi), intercept the ToolDefinition it registers via registerTool (including the real execute), memoized by `${sourcePath}#${name}` (each tool's factory replays at most once per session), then call `definition.execute` with the original params, signal, onUpdate and ctx; the result is returned unchanged
-
-### Call order
-
-- `call_tool` requires the target to be activated via `load_tools({ tools: [...], confirm: true })` first; unactivated calls are rejected with a hint showing the exact `load_tools({ tools: ["<tool name>"], confirm: true })` call
-- Activation is per-session memory, cleared at session start
-- Both resident tools' promptGuidelines state the "load_tools first, then call_tool" order; load_tools' guidelines also require loading only when the user explicitly asks. The exact confirm: true call shape is presented by the challenge text and call_tool's rejection hint for unactivated tools
+Skill hits only return paths: a skill is not a tool — read its SKILL.md via the read
+tool to get the usage.
 
 ## Startup notice
 
@@ -181,7 +172,7 @@ Merge rules:
 
 Reading: a JSON parse failure logs a warning and is treated as missing; non-string entries in the array are filtered out. Config is read at session_start; edits mid-session take effect only after starting a new session.
 
-**Note: the --tools whitelist must register every tool you want to lazy-load.** Registration and hiding are two separate things: --tools registers, the extension hides. A tool missing from --tools never reaches `getAllTools()`, so `load_tools` returns "tool metadata not found"; `resident` only decides who stays always-on and does not replace registration (see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
+**Note: the --tools whitelist must register every tool you want to lazy-load.** Registration and hiding are two separate things: --tools registers, the extension hides. A tool missing from --tools never reaches `getAllTools()`, so omnify will not find it (an empty-candidate roster still cannot call it); `resident` only decides who stays always-on and does not replace registration (see [Pitfall 1](#1---tools-is-a-strict-registration-whitelist)).
 
 ## How it works
 
@@ -189,48 +180,21 @@ The full lazy-load call chain:
 
 ```
 Session start (session_start, before the first request)
-  read both config levels → remove all non-resident tools from the active set → ensure load_tools / call_tool
-  tools field frozen afterwards; system prompt never changes
-        │
-main agent needs a tool
-        ▼
-load_tools({ tools: ["deploy_tool"] })
-  whitelist filter → return a challenge text (zero side effects, confirmRequired: true)
-  list target tool names and descriptions, warn about activation, spell out the confirm: true call shape
-        ▼
-user confirms the load is explicitly requested
-        ▼
-load_tools({ tools: ["deploy_tool"], confirm: true })
-  confirmation gate passed → tools join the per-session activated set
-  pull Description + parameter JSON Schema + Guidelines from getAllTools(), assemble a plain-text tool_result
-        │
-main agent shapes params per the usage
-        ▼
-call_tool({ tool: "deploy_tool", params: { env: "staging" } })
-  whitelist check → activation gate → schema pre-validation → replay target extension factory
-  capture and call the real execute → pass through the result unchanged
-```
+  read both config levels → remove all non-resident tools from the active set → ensure omnify
+  the tools field freezes afterwards; the system prompt never changes again
+       │
+the main agent needs a tool / skill
+       ▼
+omnify({ goal: "...", args: {...} }) (no args = schema-first)
+  search candidates: exact/contained tool-name first + description token overlap (<=5)
+       ▼
+with args: Schema validation → replay the target extension's factory, capture real execute
+  invalid args do not execute; in explicit mode, stops instead of guessing other tools
+       ▼
+success: execute result passed through unchanged; total failure: candidate + failure
+  reasons returned, with a suggestion to fall back to bash/read/edit
+  skill hit (not a tool): returns the SKILL.md path for read
 
-Four things worth knowing:
-
-- session_start (before the first request) is the only place the tools field is written; from then on the tools field and the system prompt stay frozen
-- `load_tools` returns a zero-side-effect challenge on the first call; only a second call with `confirm: true` assembles the target tool's description, parameter Schema and guidelines into a plain-text tool_result appended at the end of the message stream; the model reads it like a document
-- `call_tool` passes four gates, then replays the target extension's factory to capture the real execute; the result is passed through unchanged
-- Consequently lazy loading never invalidates the cache, on any model or provider (argument below)
-
-<details>
-<summary>Cache safety: why zero invalidation on any model</summary>
-
-Prompt caches match on a prefix: after serialization, the prefix shared with the previous request hits the cache; any byte change after the prefix pushes everything downstream out of cache. The tools field sits at the start of the serialized request, and the system prompt even earlier; changing either one invalidates the whole round.
-
-This design handles both:
-
-- the tools field is written exactly once at session_start (before the first request) and then stays frozen
-- the system prompt never changes: lazy tools are never activated, so promptGuidelines structurally cannot enter the system prompt
-
-All message growth within a session happens at the end of the stream: `load_tools`' injected usage and `call_tool` results are appended content, and appends do not touch the prefix. Conclusion: on any model and provider, lazy loading causes zero cache invalidations.
-
-</details>
 
 ## Design details and lessons learned
 
@@ -251,9 +215,9 @@ The choice here: target tools are never activated; their definitions appear as t
 
 Costs:
 
-- One extra indirection: the model sees `call_tool`; the target tool is not in the tool list
+- One extra indirection: the model sees omnify's unified call; the target tool is not in the tool list
 - Parameter validation is offloaded: no provider-level schema validation backs this up; the in-extension pre-validation compensates
-- Coarser UI and permission granularity: target tools get no dedicated permission prompts or rendering; they surface as `call_tool`
+- Coarser UI and permission granularity: target tools get no dedicated permission prompts or rendering; they surface via omnify
 
 #### Why not extension-level lazy loading (the pi-lazy-extensions approach)
 
@@ -269,11 +233,11 @@ promptGuidelines enter the system prompt only while a tool is active. Tools here
 
 #### 1. --tools is a strict registration whitelist
 
-Tools outside `--tools` are not even visible to `getAllTools()`, surfacing as "tool metadata not found" from `load_tools`. pi-lazy-tools only hides visibility; registration must come from --tools. Lesson: `--tools` owns registration; the config's `resident` array owns who stays out of the lazy set — different jobs, one does not replace the other.
+Tools outside `--tools` are not even visible to `getAllTools()`, so omnify cannot find them (an empty-candidate roster still cannot call them). pi-lazy-tools only hides visibility; registration must come from --tools. Lesson: `--tools` owns registration; the config's `resident` array owns who stays out of the lazy set — different jobs, one does not replace the other.
 
 #### 2. Extensions load at session start
 
-After installing or modifying the extension, the main agent claims there is no `load_tools`. Extensions load when the session is created; old sessions (resume included) do not have the new extension. When debugging "the main agent does not activate", opening a new session is the first move; rule this out first.
+After installing or modifying the extension, the main agent claims there is no `omnify`. Extensions load when the session is created; old sessions (resume included) do not have the new extension. When debugging "the main agent does not activate", opening a new session is the first move; rule this out first.
 
 #### 3. promptGuidelines rebuild the system prompt on activation
 
@@ -285,7 +249,7 @@ An exception thrown inside session_start is silently swallowed by pi: tools stay
 
 #### 5. jiti's injected require can load .ts and has a module cache
 
-`findToolDefinition` relies on the require injected by jiti to load the target extension's source path directly (.ts loads fine, modules are cached), an undocumented behavior that the replay mechanism builds on. Two consequences: the factory replay must be memoized by `(sourcePath, name)`, otherwise every call_tool re-runs the target extension's factory and doubles its side effects; and the fake pi must stub subscription entry points such as `events.on`, otherwise a target extension that starts subscribing during the factory phase after an upgrade will leak into the real pi.
+`findToolDefinition` relies on the require injected by jiti to load the target extension's source path directly (.ts loads fine, modules are cached), an undocumented behavior that the replay mechanism builds on. Two consequences: the factory replay must be memoized by `(sourcePath, name)`, otherwise every omnify call re-runs the target extension's factory and doubles its side effects; and the fake pi must stub subscription entry points such as `events.on`, otherwise a target extension that starts subscribing during the factory phase after an upgrade will leak into the real pi.
 
 #### 6. JSON Schema pre-validation edge cases
 
@@ -306,11 +270,11 @@ The replay load and pi's extension load must resolve to the same module instance
 
 #### When lazy-loading pays off
 
-Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of a two-step `load_tools` confirmation round-trip and the `call_tool` indirection per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools in `resident`.
+Lazy-loading keeps low-frequency definitions out of the main agent's context, at the cost of an omnify search / re-call round-trip per use. Low-frequency tools with simple parameters benefit most (remote proxies, session-resume tools); keep hot tools in `resident`.
 
 #### Troubleshooting
 
-- Tools not hidden or `load_tools` missing: start a new session first (pitfall 2)
+- Tools not hidden or `omnify` missing: start a new session first (pitfall 2)
 - "Tool metadata not found": check the `--tools` whitelist (pitfall 1)
 - List not taking effect: check the merge rules; the project config overrides the user config entirely (empty array included)
 - After upgrading pi or a target extension: regression-test the target extension's core call chain; if factory-phase behavior changed, re-evaluate the createFakePi stubs
@@ -331,7 +295,7 @@ npm test            # node --import tsx --test test/core.test.ts test/integratio
 npm run typecheck   # tsc --noEmit (strict mode)
 ```
 
-Coverage: config merging, whitelist filtering, schema pre-validation edge cases (invalid pattern, object schema without an explicit type, `__proto__` keys, required error messages), the load_tools two-step confirmation gate (challenge text content, confirm omitted or false activates nothing, confirm: true activates, empty and all-rejected requests skip the gate, the user-explicitly-asks constraint) and the call_tool end-to-end wiring (unactivated call rejected, invalid params not executed, factory memoization, events.on stubbing). Integration tests load the extension source for real.
+Coverage: config merging, schema pre-validation edge cases (invalid pattern, object schema without an explicit type, `__proto__` keys, required error messages), the omnify four-in-one wiring (schema-first zero execution, explicit tool naming, invalid params not executed, factory memoization, skill hits returning SKILL.md paths). Integration tests load the extension source for real.
 
 ## License
 
