@@ -195,6 +195,9 @@ export default function (pi: ExtensionAPI) {
 	let lazyNames: string[] = [];
 	let lazySet = new Set<string>();
 	let skills: SkillMeta[] = [];
+	// session 级：schema-first 摘要按工具缓存；成功执行过的工具不再重复展示摘要
+	const summaryCache = new Map<string, string>();
+	const usedTools = new Set<string>();
 
 	const renderToolSpec = (name: string, description: string, schema: object): string =>
 		`- ${name}
@@ -253,11 +256,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// b. 无 args：schema-first。返候选参数要求，供模型补参重试（零执行副作用）。
+			// 已成功执行过的工具只给占位（参数要求前已给出），不重复输出 description+摘要。
 			if (!hasArgs) {
 				const need = matched
 					.map((name) => {
 						const t = toolMap.get(name)!;
-						return renderToolSpec(name, t.description, t.parameters as object);
+						if (usedTools.has(name)) {
+							return `- ${name}：本会话已成功调用过，参数要求同前；直接补 args 重试。`;
+						}
+						let text = summaryCache.get(name);
+						if (text === undefined) {
+							text = renderToolSpec(name, t.description, t.parameters as object);
+							summaryCache.set(name, text);
+						}
+						return text;
 					})
 					.join("\n");
 				return {
@@ -298,6 +310,7 @@ export default function (pi: ExtensionAPI) {
 						onUpdate,
 						ctx,
 					);
+					usedTools.add(name);
 					return {
 						content: result.content,
 						details: { ok: true, tool: name, ...(result?.details ?? {}) },
@@ -365,6 +378,8 @@ export default function (pi: ExtensionAPI) {
 				.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
 			definitionCache.clear();
+			summaryCache.clear();
+			usedTools.clear();
 			const notice = buildStartupNotice({
 				toolNames: lazyNames,
 				userConfigPath,

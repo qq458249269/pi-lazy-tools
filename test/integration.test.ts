@@ -88,6 +88,8 @@ interface BootOptions {
 
 interface Harness {
 	boot(residentNames?: string[], options?: BootOptions): Promise<void>;
+	/** 同一扩展实例内再次触发 session_start（新会话，工作区重建），验证 per-session 缓存清理。 */
+	reboot(residentNames?: string[], options?: BootOptions): Promise<void>;
 	cleanup(): void;
 	omnify(params: {
 		goal: string;
@@ -128,6 +130,46 @@ const createLazyToolsExtension: (pi: never) => void =
 	typeof innerExport === "function"
 		? (innerExport as (pi: never) => void)
 		: (extModule as never);
+
+/** 重建临时工作区并写入配置，返回工作区路径。 */
+function reInitWorkspace(residentNames: string[], options: BootOptions): string {
+	const ws = mkdtempSync(join(tmpdir(), "lazy-tools-it-"));
+	mkdirSync(join(ws, ".pi"));
+	if (options.writeProjectConfig !== false) {
+		writeFileSync(join(ws, ".pi", "lazy-tools.json"), JSON.stringify({ resident: residentNames }));
+	}
+	return ws;
+}
+
+/** 对已捕获的 session_start handlers 触发一次会话启动（共享同一扩展实例）。 */
+async function fireSessionStartHandlers(
+	sessionHandlers: SessionHandler[],
+	notifyCalls: Array<{ text: string; options?: unknown }>,
+	workspace: string,
+	options: BootOptions,
+): Promise<void> {
+	const event: SessionEvent = {
+		type: "session_start",
+		reason: options.reason ?? "startup",
+	};
+	const ctx: {
+		cwd: string;
+		ui?: { notify?: (text: string, options?: unknown) => void };
+	} = { cwd: workspace };
+	if (options.withUi !== false) {
+		ctx.ui = {};
+		if (options.notifyImpl !== undefined) {
+			ctx.ui.notify = options.notifyImpl;
+		} else if (options.withNotify !== false) {
+			ctx.ui.notify = (text, rawOptions) => {
+				notifyCalls.push({ text, options: rawOptions });
+			};
+		}
+	}
+	for (const handler of sessionHandlers) {
+		await handler(event, ctx);
+	}
+}
 
 /**
  * Boot the real lazy-tools extension against a fake pi, capturing registered
@@ -207,34 +249,7 @@ function createHarness(): Harness {
 			setActiveToolsCalls = 0;
 			lastActiveTools = undefined;
 			userHome = undefined;
-			workspace = mkdtempSync(join(tmpdir(), "lazy-tools-it-"));
-			mkdirSync(join(workspace, ".pi"));
-			if (options.writeProjectConfig !== false) {
-				writeFileSync(
-					join(workspace, ".pi", "lazy-tools.json"),
-					JSON.stringify({ resident: residentNames }),
-				);
-			}
-
-			const event: SessionEvent = {
-				type: "session_start",
-				reason: options.reason ?? "startup",
-			};
-
-			const ctx: {
-				cwd: string;
-				ui?: { notify?: (text: string, options?: unknown) => void };
-			} = { cwd: workspace };
-			if (options.withUi !== false) {
-				ctx.ui = {};
-				if (options.notifyImpl !== undefined) {
-					ctx.ui.notify = options.notifyImpl;
-				} else if (options.withNotify !== false) {
-					ctx.ui.notify = (text, rawOptions) => {
-						notifyCalls.push({ text, options: rawOptions });
-					};
-				}
-			}
+			workspace = reInitWorkspace(residentNames, options);
 
 			const originalHome = process.env.HOME;
 			const originalProfile = process.env.USERPROFILE;
@@ -247,9 +262,7 @@ function createHarness(): Harness {
 			}
 
 			try {
-				for (const handler of sessionHandlers) {
-					await handler(event, ctx);
-				}
+				await fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace, options);
 			} finally {
 				if (tempUserHome !== undefined) {
 					if (originalHome === undefined) delete process.env.HOME;
@@ -259,6 +272,14 @@ function createHarness(): Harness {
 					rmSync(tempUserHome, { recursive: true, force: true });
 				}
 			}
+		},
+		reboot(residentNames: string[] = [], options: BootOptions = {}): Promise<void> {
+			// 与 boot 共享同一扩展实例（闭包缓存不重建），仅重新触发 session_start
+			notifyCalls.length = 0;
+			setActiveToolsCalls = 0;
+			lastActiveTools = undefined;
+			workspace = reInitWorkspace(residentNames, options);
+			return fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace, options);
 		},
 		cleanup(): void {
 			if (workspace) rmSync(workspace, { recursive: true, force: true });
@@ -360,7 +381,65 @@ describe("omnify (四合一搜索调用)", () => {
 		});
 	});
 
-	// O2: 显式 tool 指名 + args → 校验通过直接执行透传（自动激活，无前置 load）
+	// O2: 成功执行后再次无 args schema-first → 只返占位，不重复完整参数说明
+	it("should show a short placeholder instead of the full spec for tools already used this session", async () => {
+		await withHarness([], async (h) => {
+			await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } });
+			const result = (await h.omnify({ goal: FAKE_TOOL_NAME })) as {
+				content: Array<{ type: string; text: string }>;
+				details: { phase?: string };
+			};
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.ok(
+				text.includes("已成功调用过"),
+				`used tool should get a placeholder; got: ${text}`,
+			);
+			assert.ok(
+				!/(action:|用途：)/.test(text),
+				`placeholder must not repeat the full spec; got: ${text}`,
+			);
+			assert.equal(result.details.phase, "need-args");
+		});
+	});
+
+	// O2b: 未成功过的工具重复 schema-first → 摘要缓存命中，输出一致
+	it("should reuse the cached schema summary across repeated need-args calls", async () => {
+		await withHarness([], async (h) => {
+			const first = (await h.omnify({ goal: FAKE_TOOL_NAME })) as { content: Array<{ type: string; text: string }> };
+			const second = (await h.omnify({ goal: FAKE_TOOL_NAME })) as { content: Array<{ type: string; text: string }> };
+			assert.equal(
+				second.content.map((c) => c.text).join("\n"),
+				first.content.map((c) => c.text).join("\n"),
+				"repeated need-args should return the identical cached summary",
+			);
+		});
+	});
+
+	// O2c: per-session 缓存（usedTools/摘要）随新 session_start 清空，不跨会话泄漏
+	it("should reset usedTools and summary caches on a fresh session_start within the same instance", async () => {
+	 await withHarness([], async (h) => {
+		await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } });
+
+		const placeholder = (await h.omnify({ goal: FAKE_TOOL_NAME })) as { content: Array<{ type: string; text: string }> };
+		assert.ok(
+			placeholder.content.map((c) => c.text).join("\n").includes("已成功调用过"),
+			"post-use need-args should be a placeholder before the reboot",
+		);
+
+		// 同一扩展实例内新会话：usedTools/摘要缓存必须清空，否则跨会话误返占位
+		await h.reboot();
+		const fresh = (await h.omnify({ goal: FAKE_TOOL_NAME })) as { content: Array<{ type: string; text: string }> };
+		const text = fresh.content.map((c) => c.text).join("\n");
+		assert.ok(!text.includes("已成功调用过"), `fresh session must not reuse used-tool placeholder; got: ${text}`);
+		assert.ok(text.includes("用途："), `fresh session should restore the full spec; got: ${text}`);
+
+		// 新会话里目标工厂应重新重放（definitionCache 同样被清）——execute 仍可用
+		const again = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "submit" } })) as RenderedResult;
+		assert.match(again.content[0].text, /fake ran: submit/);
+	 });
+	});
+
+	// O3: 显式 tool 指名 + args → 校验通过直接执行透传（自动激活，无前置 load）
 	it("should invoke the target and pass through its result when tool is explicit and args valid", async () => {
 		await withHarness([], async (h) => {
 			const result = (await h.omnify({
