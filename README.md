@@ -2,12 +2,9 @@
 
 pi-lazy-tools：让低频工具像 Skill 一样按需加载的 pi 扩展。
 
-> [English](README.en.md) | 中文
->
-
 主 Agent 能调用哪些工具、每个工具几千字节的说明书，很大程度上决定了它能做什么。这些说明书每一轮请求都完整出现在上下文里，包括那些 95% 场合根本用不上的工具：主 Agent 不得不一遍遍重新扫过它们，注意力持续被稀释。我们此前做的 [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation) 在 subagent 维度落实了这条「上下文纯净」哲学：主智能体只负责派活、不碰任务细节；工具维度还剩一类问题：低频工具的定义每轮都在场。
 
-Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（--tools 白名单、pi 运行时元数据都不动），会话开始时把非常驻工具（缺省 = 全部已装工具）从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由唯常驻入口 `omnify` 一步完成搜索、取用法与代理执行（四合一：原 load_tools / call_tool / skill_search 并入），执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。因 tools 字段与系统提示词在会话内再也不变，懒加载不造成任何缓存失效，任意模型通用（论证见[工作原理](#工作原理)）。
+Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（启动参数与 pi 运行时元数据都不动），会话开始时把非常驻工具（缺省 = 全部已装工具）从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由唯常驻入口 `omnify` 一步完成搜索、取用法与代理执行（四合一：原 load_tools / call_tool / skill_search 并入），执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。因 tools 字段与系统提示词在会话内再也不变，懒加载不造成任何缓存失效，任意模型通用（论证见[工作原理](#工作原理)）。
 
 ## 目录
 
@@ -38,7 +35,7 @@ lazy-tools/
 ├── lazy-tools.ts        # 扩展入口：配置读取、session_start、omnify 单常驻
 ├── lazy-tools/
 │   └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
-└── test/                # 71 个测试（node:test + tsx）
+└── test/                # 74 个测试（node:test + tsx）
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -48,7 +45,7 @@ lazy-tools/
 安装后还需三步：
 
 1. 写配置（见[最小配置](#最小配置)；不写则默认全量 lazy）
-2. 启动命令的 `--tools` 白名单里保留 lazy 工具（注册与隐藏是两件事，详见[配置](#配置)）
+2. 别用启动参数裁剪工具搜索池（裸 `pi.exe` 即可；注册与隐藏是两件事，详见[配置](#配置)）
 3. 开新会话生效（扩展在会话启动时加载，旧会话没有 `omnify`）
 
 typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 node_modules）。
@@ -157,7 +154,7 @@ Schema 预校验支持 type / required / enum / pattern / properties / additiona
 
 文件读取：JSON 解析失败只打告警、按缺失处理；数组中的非字符串项被过滤。配置在 session_start 时读取，会话中途修改不生效，需开新会话。
 
-**注意：--tools 白名单须注册你要按需加载的工具。** 注册与隐藏是两件事：--tools 负责注册，扩展只负责隐藏。未进 `--tools` 的工具 `getAllTools()` 查不到，omnify 会搜不到它（候选为空时返名录后仍无法调用）；`resident` 只决定谁常驻、不替代注册（详见[坑 1](#1---tools-是严格注册白名单)）。
+**注意：不要用启动参数裁掉 omnify 的搜索池。** 注册与隐藏是两件事：pi 负责注册，扩展只负责隐藏。裸 `pi.exe`（不带任何工具参数）启动时 pi 的 `allowedToolNames` 为 undefined、注册表不做过滤，`getAllTools()` 返回全部内置工具（read/bash/powershell/edit/write/grep/find/ls）与全部扩展工具，omnify 全都搜得到。只有 `-t/--tools`、`-nt/--no-tools`、`-xt/--exclude-tools` 会真正把工具移出搜索池（详见[坑 1](#1---tools-只在显式传参时裁剪注册表)）。`resident` 只决定谁常驻，与注册无关。
 
 ## 工作原理
 
@@ -236,9 +233,17 @@ promptGuidelines 只在工具 active 时进入系统提示词。本设计的工�
 
 ### 踩过的坑
 
-#### 1. --tools 是严格注册白名单
+#### 1. --tools 只在显式传参时裁剪注册表
 
-不在 `--tools` 名单里的工具连 `getAllTools()` 都查不到，表现为 omnify 搜不到它（候选为空返名录后仍无法调用）。pi-lazy-tools 只负责隐藏可见性；注册必须由 --tools 完成。教训：`--tools` 决定注册，`lazy-tools.json` 的 `resident` 决定常驻例外，各管一头、互不替代。
+按 pi 0.87.x 的实现（`dist/core/sdk.js` → `allowedToolNames = options.tools ?? (noTools === "all" ? [] : undefined)`，注册表按 `isAllowedTool()` 过滤），`--tools` 不是无条件白名单：
+
+- **不传任何工具参数**（裸 `pi.exe`）→ `allowedToolNames` 为 undefined，注册表不过滤。`getAllTools()` 返回全部内置工具（含默认不 active 的 grep/find/ls/powershell）与全部扩展工具，omnify 都能搜到、能执行。裸启动反而是最省事的情形。
+- **`-t/--tools a,b`** → `allowedToolNames` 变成白名单，注册表只剩列出的名字，其余 omnify 搜不到。
+- **`-nt/--no-tools`** → `allowedToolNames=[]`，注册表清空，只剩 omnify 自己。
+- **`-xt/--exclude-tools X`** → X 从注册表剔除，omnify 搜不到。
+- **`-nbt/--no-builtin-tools`** → 只清空初始 active 集，注册表不动，omnify 照常搜得到。
+
+只想调「首轮送给模型的 active 集」就改 `settings.json` 的 `defaultTools`，它不影响 omnify 的搜索池。pi-lazy-tools 只负责隐藏可见性；`lazy-tools.json` 的 `resident` 只决定谁常驻。教训：`--tools` 决定注册范围，`resident` 决定常驻例外，各管一头、互不替代。
 
 #### 2. 扩展在会话启动时加载
 
@@ -280,7 +285,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 #### 排障清单
 
 - 工具没隐藏或 `omnify` 不存在：先开新会话（坑 2）
-- 「未找到工具元数据」：查 `--tools` 白名单（坑 1）
+- 「未找到工具元数据」：查启动参数有没有 `-t/--tools`、`-nt/--no-tools`、`-xt/--exclude-tools`（坑 1）
 - 名单不生效：查合并规则，项目级整体覆盖用户级（含空数组）
 - 升级 pi 或目标扩展后：回归目标扩展的核心调用链路；目标扩展工厂期行为若有变化，重评 createFakePi 打桩
 
@@ -291,7 +296,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 
 ## 开发
 
-测试位于 `test/`，97 个用例（68 单元 + 29 集成）：
+测试位于 `test/`，74 个用例（54 单元 + 20 集成）：
 
 ```bash
 cd pi-lazy-tools
