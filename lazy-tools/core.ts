@@ -5,14 +5,11 @@
  * standalone unit tests.
  */
 
-export interface LazyConfig {
-	resident?: unknown;
-	[key: string]: unknown;
-}
-
-export interface LazyList {
-	resident: string[];
-}
+/**
+ * pi 未配置 `defaultTools` 时的内置默认常驻工具（与 pi sdk 的
+ * `defaultActiveToolNames` 保持一致：read, bash, edit, write）。
+ */
+export const PI_BUILTIN_DEFAULT_TOOLS: readonly string[] = ["read", "bash", "edit", "write"];
 
 export interface ValidationResult {
 	ok: boolean;
@@ -20,10 +17,14 @@ export interface ValidationResult {
 }
 
 export interface StartupNoticeInput {
+	/** lazy（移出 active 集）的工具名。 */
 	toolNames: string[];
-	userConfigPath: string;
-	projectConfigPath: string;
-	effectiveConfigPath: string | null;
+	/** 常驻（不 lazy）工具名。 */
+	resident: string[];
+	/** 提供 defaultTools 的 settings.json 路径；null = 未配置，取 pi 内置默认。 */
+	sourcePath: string | null;
+	userSettingsPath: string;
+	projectSettingsPath: string;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -35,28 +36,38 @@ function extractStringArray(value: unknown): string[] | undefined {
 	return value.filter((item): item is string => typeof item === "string");
 }
 
+/** 候选取值来源：settings.json 路径 + 其 defaultTools 原始值。 */
+export interface DefaultToolsCandidate {
+	path: string;
+	defaultTools: unknown;
+}
+
+export interface ResolvedResident {
+	/** 常驻（不 lazy）工具名：已过滤非字符串项并去重。 */
+	resident: string[];
+	/** 命中的 settings.json 路径；null = 所有候选都没有合法 defaultTools，取 pi 内置默认。 */
+	path: string | null;
+}
+
 /**
- * Merge user-level and project-level resident (non-lazy) exception configs.
+ * 解析常驻名单：与 pi 共用 `settings.json` 的 `defaultTools` 字段。
  *
- * - If projectCfg is non-null and contains a `resident` array, it fully replaces
- *   the user config.
- * - Otherwise fall back to userCfg.
- * - Non-array `resident` fields are treated as absent.
- * - Non-string entries in the array are filtered out.
+ * - 候选按优先级排列（项目级在前），取第一个含合法 `defaultTools` 字符串数组的来源。
+ * - 非数组（缺失/类型错）视为未配置，继续看下一个候选。
+ * - 空数组是合法取值：表示除 omnify 外全部 lazy。
+ * - 全部候选都没有合法取值时，回退 pi 内置默认（PI_BUILTIN_DEFAULT_TOOLS）。
  */
-export function mergeLazyConfigs(
-	userCfg: LazyConfig | null,
-	projectCfg: LazyConfig | null,
-): LazyList {
-	for (const cfg of [projectCfg, userCfg]) {
-		if (isObject(cfg)) {
-			const resident = extractStringArray(cfg.resident);
-			if (resident !== undefined) {
-				return { resident };
-			}
+export function resolveDefaultTools(
+	candidates: readonly DefaultToolsCandidate[],
+	fallback: readonly string[] = PI_BUILTIN_DEFAULT_TOOLS,
+): ResolvedResident {
+	for (const candidate of candidates) {
+		const list = extractStringArray(candidate.defaultTools);
+		if (list !== undefined) {
+			return { resident: [...new Set(list)], path: candidate.path };
 		}
 	}
-	return { resident: [] };
+	return { resident: [...new Set(fallback)], path: null };
 }
 
 function describeValue(value: unknown): string {
@@ -174,37 +185,12 @@ export function validateParams(schema: unknown, params: unknown): ValidationResu
 	return { ok: errors.length === 0, errors };
 }
 
-function hasValidResidentArray(cfg: LazyConfig | null): boolean {
-	return isObject(cfg) && Array.isArray(cfg.resident);
-}
-
-/**
- * Select which config path is currently effective.
- *
- * - If the project config contains a valid `resident` array (empty array counts),
- *   the project path wins.
- * - Otherwise fall back to the user config if it contains a valid `resident` array.
- * - If neither config has a valid `resident` array, return null.
- *
- * Non-string entries inside the array do not affect the array's validity.
- */
-export function selectEffectiveConfigPath(
-	userCfg: LazyConfig | null,
-	projectCfg: LazyConfig | null,
-	userPath: string,
-	projectPath: string,
-): string | null {
-	if (hasValidResidentArray(projectCfg)) return projectPath;
-	if (hasValidResidentArray(userCfg)) return userPath;
-	return null;
-}
-
 /**
  * Build the startup notice text shown when a session starts.
  *
- * Lists the merged lazy tool names and states which configuration file is
- * currently effective. When no config is effective, both candidate locations
- * are listed together with a note that neither file exists.
+ * Lists the lazy tool names, the resident (non-lazy) names, and where the
+ * resident list came from. When no `defaultTools` is configured anywhere, both
+ * settings.json locations are listed so the user knows where to write it.
  */
 export function buildStartupNotice(input: StartupNoticeInput): string {
 	const lines: string[] = [];
@@ -217,16 +203,23 @@ export function buildStartupNotice(input: StartupNoticeInput): string {
 		}
 	}
 	lines.push("");
-
-	if (input.effectiveConfigPath !== null) {
-		lines.push("当前生效的配置文件为：");
-		lines.push(input.effectiveConfigPath);
+	lines.push("当前常驻名单（settings.json 的 defaultTools）：");
+	if (input.resident.length === 0) {
+		lines.push("（空：除 omnify 外全部按需加载）");
 	} else {
-		lines.push("当前暂无配置文件：");
-		lines.push(`用户级：${input.userConfigPath}`);
-		lines.push(`项目级：${input.projectConfigPath}`);
-		lines.push("");
-		lines.push("以上两个文件均不存在");
+		for (const name of input.resident) {
+			lines.push(`- ${name}`);
+		}
+	}
+	lines.push("");
+
+	if (input.sourcePath !== null) {
+		lines.push("当前生效的配置文件为：");
+		lines.push(input.sourcePath);
+	} else {
+		lines.push("当前未配置 defaultTools，取 pi 内置默认。配置位置：");
+		lines.push(`用户级：${input.userSettingsPath}`);
+		lines.push(`项目级：${input.projectSettingsPath}`);
 	}
 
 	return lines.join("\n");

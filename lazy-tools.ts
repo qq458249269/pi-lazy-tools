@@ -6,11 +6,11 @@
  * （有 args 时）。未匹配则返回全部工具名录 + 技能命中（SKILL.md 路径），
  * 并建议退回 bash/read/编辑 等常规手段。
  *
- * 配置为 resident 例外（不 lazy、留在初始 active 集）：
- *   User:    ~/.pi/lazy-tools.json
- *   Project: <cwd>/.pi/lazy-tools.json
- *   Format:  { "resident": string[] }
- * 无配置则除 omnify 外全量 lazy。
+ * 常驻名单（不 lazy）来自 pi 自己的 `settings.json` 的 `defaultTools` 字段：
+ *   User:    ~/.pi/agent/settings.json
+ *   Project: <cwd>/.pi/settings.json（需项目受信任才生效，与 pi 自身规则一致）
+ * 两处都没有该字段时，取 pi 内置默认（read, bash, edit, write）；
+ * 显式写 `"defaultTools": []` 即全部 lazy。
  */
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -20,12 +20,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import * as fs from "node:fs";
 import {
-	mergeLazyConfigs,
-	selectEffectiveConfigPath,
+	resolveDefaultTools,
 	validateParams,
 	buildStartupNotice,
 	rankToolMatches,
-	type LazyConfig,
+	type DefaultToolsCandidate,
 } from "./lazy-tools/core.ts";
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -34,8 +33,14 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 const jiti = createJiti(import.meta.url);
 
-const CONFIG_NAME = "lazy-tools.json";
 const OMNIFY_NAME = "omnify";
+
+/** pi 的 agent 目录（settings.json 所在处）；pi 以 PI_CODING_AGENT_DIR 覆盖。 */
+const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+const CONFIG_DIR = ".pi";
+const SETTINGS_FILE = "settings.json";
+/** 旧版本扩展自有的配置文件：已被 settings.json 的 defaultTools 取代，仅用于迁移告警。 */
+const LEGACY_CONFIG_FILE = "lazy-tools.json";
 
 interface SkillMeta {
 	name: string;
@@ -61,24 +66,48 @@ const RULES_NOTE =
 const DOCS_NOTE =
 	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 docs/ 与 examples/（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
 
-/**
- * Read a single lazy-tools config file. Returns null if the file is missing or
- * malformed; warnings are logged for unexpected errors.
- */
-function readConfigFile(path: string): LazyConfig | null {
+/** pi 的 agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`。 */
+function getAgentDir(): string {
+	const fromEnv = process.env[AGENT_DIR_ENV];
+	if (fromEnv && fromEnv.length > 0) {
+		return join(fromEnv.startsWith("~") ? homedir() + fromEnv.slice(1) : fromEnv);
+	}
+	return join(homedir(), CONFIG_DIR, "agent");
+}
+
+/** 读一个 JSON 对象文件；缺失/解析失败/非对象一律返回 null（仅告警）。 */
+function readJsonObject(path: string): Record<string, unknown> | null {
 	try {
 		const text = fs.readFileSync(path, "utf-8");
 		const parsed = JSON.parse(text) as unknown;
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			return parsed as LazyConfig;
-		}
+		if (isObject(parsed)) return parsed;
+		console.warn(`[lazy-tools] ignoring non-object JSON at ${path}`);
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
 			const message = err instanceof Error ? err.message : String(err);
-			console.warn(`[lazy-tools] failed to read config ${path}: ${message}`);
+			console.warn(`[lazy-tools] failed to read ${path}: ${message}`);
 		}
 	}
 	return null;
+}
+
+/**
+ * 旧 `lazy-tools.json` 若还在，提醒用户把 resident 迁到 settings.json 的
+ * defaultTools（只告警不改文件，也不影响名单计算）。每进程只提醒一次，
+ * 免得 resume/fork/reload 反复刷屏。
+ */
+let legacyWarned = false;
+function warnLegacyConfigs(paths: readonly string[]): void {
+	if (legacyWarned) return;
+	for (const path of paths) {
+		if (fs.existsSync(path)) {
+			console.warn(
+				`[lazy-tools] ${path} 已不再读取：常驻名单改由 pi settings.json 的 defaultTools 决定，` +
+					`请把其中的 resident 数组原样搬进该字段。`,
+			);
+			legacyWarned = true;
+		}
+	}
 }
 
 const definitionCache = new Map<string, ToolDefinition>();
@@ -372,36 +401,59 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		try {
 			const cwd = ctx.cwd ?? process.cwd();
-			const userConfigPath = join(homedir(), ".pi", CONFIG_NAME);
-			const projectConfigPath = join(cwd, ".pi", CONFIG_NAME);
-			const userConfig = readConfigFile(userConfigPath);
-			const projectConfig = readConfigFile(projectConfigPath);
-			const effectiveConfigPath = selectEffectiveConfigPath(
-				userConfig,
-				projectConfig,
-				userConfigPath,
-				projectConfigPath,
-			);
-			// 无有效配置 → 例外仅 omnify：全量 lazy；名单为 session_start 时点快照
-			const resident = new Set([OMNIFY_NAME]);
-			if (effectiveConfigPath !== null) {
-				for (const name of mergeLazyConfigs(userConfig, projectConfig).resident) {
-					resident.add(name);
-				}
-			}
-			lazyNames = pi
+			// 与 pi 自身一致：项目未受信任时忽略项目级 settings.json。
+			const projectTrusted = ctx.isProjectTrusted?.() ?? true;
+			const userSettingsPath = join(getAgentDir(), SETTINGS_FILE);
+			const projectSettingsPath = join(cwd, CONFIG_DIR, SETTINGS_FILE);
+			warnLegacyConfigs([
+				join(homedir(), CONFIG_DIR, LEGACY_CONFIG_FILE),
+				join(cwd, CONFIG_DIR, LEGACY_CONFIG_FILE),
+			]);
+			const userSettings = readJsonObject(userSettingsPath);
+			const projectSettings = projectTrusted ? readJsonObject(projectSettingsPath) : null;
+			// 项目级覆盖用户级（与 pi 的 settings 合并规则相同：数组整体替换）；
+			// 两处都无 defaultTools 时取 pi 内置默认。
+			const candidates: DefaultToolsCandidate[] = [
+				{ path: projectSettingsPath, defaultTools: projectSettings?.defaultTools },
+				{ path: userSettingsPath, defaultTools: userSettings?.defaultTools },
+			];
+			const resolved = resolveDefaultTools(candidates);
+
+			// omnify 是常驻入口，不经 settings.json：这里无条件把它写进 active 集。
+			// 但它必须先在注册表里（-t/--tools 会把未列名工具移出注册表），
+			// 否则本会话若照常隐藏其余工具就没有取用入口——此时不懒加载，只告警。
+			const allToolNames = pi
 				.getAllTools()
-				.map((tool) => tool.name)
-				.filter((name) => !resident.has(name));
+				.map((tool) => tool.name);
+			if (!allToolNames.includes(OMNIFY_NAME)) {
+				lazyNames = [];
+				lazySet = new Set();
+				const message =
+					`[lazy-tools] ${OMNIFY_NAME} 不在工具注册表（启动参数裁剪了搜索池），` +
+					`本会话不做懒加载。裸 pi.exe 启动即可恢复。`;
+				console.warn(message);
+				if (event?.reason === "startup") {
+					try {
+						ctx?.ui?.notify?.(message, "warning");
+					} catch {
+						// 提示失败不影响会话
+					}
+				}
+				return;
+			}
+
+			const resident = new Set([OMNIFY_NAME, ...resolved.resident]);
+			lazyNames = allToolNames.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
 			definitionCache.clear();
 			summaryCache.clear();
 			usedTools.clear();
 			const notice = buildStartupNotice({
 				toolNames: lazyNames,
-				userConfigPath,
-				projectConfigPath,
-				effectiveConfigPath,
+				resident: resolved.resident,
+				sourcePath: resolved.path,
+				userSettingsPath,
+				projectSettingsPath,
 			});
 
 			const active = pi.getActiveTools();

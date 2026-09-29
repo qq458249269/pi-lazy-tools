@@ -11,17 +11,20 @@
  * findToolDefinition's module replay mechanism is exercised for real.
  *
  * The harness also records ctx.ui.notify calls made during session_start so the
- * startup notice can be asserted (tool list + effective config path), and
- * supports booting without ui/notify to verify the silent-skip branches, plus a
- * throwing notify implementation to verify a notify failure cannot break the
- * lazy-filter setup (setActiveTools must still run). The session_start event is
- * configurable (reason defaults to "startup", the only reason that should
- * notify, per the new contract).
+ * startup notice can be asserted (tool list + resident list + effective
+ * settings.json path), and supports booting without ui/notify to verify the
+ * silent-skip branches, plus a throwing notify implementation to verify a
+ * notify failure cannot break the lazy-filter setup (setActiveTools must still
+ * run). The session_start event is configurable (reason defaults to "startup",
+ * the only reason that should notify, per the new contract).
  *
- * User-level config path control: the handler resolves the user config via
- * os.homedir(), which reads process.env.HOME on POSIX, so boot() can point HOME
- * at a throwaway temp directory to simulate "no user-level config"
- * deterministically (freshUserHome option).
+ * Config source control: the extension reads pi's `defaultTools` from
+ * `<cwd>/.pi/settings.json` (project) and `<agentDir>/settings.json` (user,
+ * agentDir derives from os.homedir() which reads process.env.HOME on POSIX).
+ * boot() can therefore write a project settings.json, and freshUserHome points
+ * HOME at a throwaway temp dir so the user-level settings path can be
+ * simulated/blanked deterministically. projectTrusted drives
+ * ctx.isProjectTrusted(), which gates the project-level settings file.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -40,6 +43,9 @@ import {
 
 const FIXTURE_SOURCE = join(import.meta.dirname, "fixtures", "fake-target.ts");
 
+/** 扩展唯一的常驻入口名（写死在此以便断言与模拟注册表裁剪）。 */
+const OMNIFY_NAME = "omnify";
+
 /** 目标工具 execute 的返回形态（透传断言用）。 */
 interface RenderedResult {
 	content: Array<{ type: string; text: string }>;
@@ -56,7 +62,11 @@ interface SessionEvent {
 
 type SessionHandler = (
 	event: SessionEvent,
-	ctx: { cwd?: string; ui?: { notify?: (text: string, options?: unknown) => void } },
+	ctx: {
+		cwd?: string;
+		ui?: { notify?: (text: string, options?: unknown) => void };
+		isProjectTrusted?: () => boolean;
+	},
 ) => void | Promise<void>;
 
 /** before_agent_start handler 的最小形态（扩展消费 systemPrompt、systemPromptOptions.skills 与 sections）。 */
@@ -80,10 +90,24 @@ interface BootOptions {
 	notifyImpl?: (text: string, options?: unknown) => void;
 	/** session_start 事件的 reason（默认 "startup"，保证既有 C1 语义；非 startup 不应弹通知）。 */
 	reason?: SessionReason;
-	/** 是否在临时工作区写 .pi/lazy-tools.json（默认 true；false 模拟项目级配置缺失）。 */
-	writeProjectConfig?: boolean;
-	/** 是否用临时目录架空 process.env.HOME（默认 false）。 */
+	/** 是否在临时工作区写 .pi/settings.json（默认 true；false 模拟项目级无 defaultTools）。 */
+	writeProjectSettings?: boolean;
+	/** 是否用临时目录架空 process.env.HOME（默认 true；false = 读真实用户级 settings.json）。 */
 	freshUserHome?: boolean;
+	/**
+	 * 用户级 settings.json 的 defaultTools（默认 undefined = 不写）。
+	 * 配合 freshUserHome 写进临时 HOME，模拟用户级配置。
+	 */
+	userDefaultTools?: string[];
+	/** ctx.isProjectTrusted() 的返回值（默认 true）。false 时项目级 settings.json 应被忽略。 */
+	projectTrusted?: boolean;
+	/** 是否在临时工作区写旧版 .pi/lazy-tools.json（默认 false；用于迁移告警断言）。 */
+	writeLegacyConfig?: boolean;
+	/**
+	 * 模拟启动参数裁剪注册表：把 omnify 从 getAllTools() 里抹掉
+	 * （pi 的 -t/--tools 对未列名工具就是这么干的）。
+	 */
+	hideOmnifyFromRegistry?: boolean;
 }
 
 interface Harness {
@@ -100,6 +124,7 @@ interface Harness {
 	getSetActiveToolsCalls(): number;
 	getWorkspacePath(): string | undefined;
 	getUserHomePath(): string | undefined;
+	getUserSettingsPath(): string | undefined;
 	getRegisteredTool(name: string): Record<string, unknown> | undefined;
 	fireBeforeAgentStart(
 		systemPromptOptions: unknown,
@@ -131,14 +156,31 @@ const createLazyToolsExtension: (pi: never) => void =
 		? (innerExport as (pi: never) => void)
 		: (extModule as never);
 
-/** 重建临时工作区并写入配置，返回工作区路径。 */
-function reInitWorkspace(residentNames: string[], options: BootOptions): string {
+/** 重建临时工作区并写入项目级 settings.json，返回工作区路径。 */
+function reInitWorkspace(defaultTools: string[], options: BootOptions): string {
 	const ws = mkdtempSync(join(tmpdir(), "lazy-tools-it-"));
 	mkdirSync(join(ws, ".pi"));
-	if (options.writeProjectConfig !== false) {
-		writeFileSync(join(ws, ".pi", "lazy-tools.json"), JSON.stringify({ resident: residentNames }));
+	if (options.writeProjectSettings !== false) {
+		writeFileSync(
+			join(ws, ".pi", "settings.json"),
+			JSON.stringify({ defaultTools }, null, 2),
+		);
+	}
+	if (options.writeLegacyConfig) {
+		writeFileSync(
+			join(ws, ".pi", "lazy-tools.json"),
+			JSON.stringify({ resident: defaultTools }),
+		);
 	}
 	return ws;
+}
+
+/** 在临时用户 HOME 下写用户级 settings.json（模拟 ~/.pi/agent/settings.json）。 */
+function writeUserSettings(userHome: string, defaultTools: string[] | undefined): void {
+	if (defaultTools === undefined) return;
+	const dir = join(userHome, ".pi", "agent");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "settings.json"), JSON.stringify({ defaultTools }, null, 2));
 }
 
 /** 对已捕获的 session_start handlers 触发一次会话启动（共享同一扩展实例）。 */
@@ -155,7 +197,8 @@ async function fireSessionStartHandlers(
 	const ctx: {
 		cwd: string;
 		ui?: { notify?: (text: string, options?: unknown) => void };
-	} = { cwd: workspace };
+		isProjectTrusted: () => boolean;
+	} = { cwd: workspace, isProjectTrusted: () => options.projectTrusted ?? true };
 	if (options.withUi !== false) {
 		ctx.ui = {};
 		if (options.notifyImpl !== undefined) {
@@ -184,6 +227,8 @@ function createHarness(): Harness {
 	let lastActiveTools: string[] | undefined;
 	let workspace: string | undefined;
 	let userHome: string | undefined;
+	let userSettingsPath: string | undefined;
+	let hideOmnifyFromRegistry = false;
 
 	const fakePi = {
 		registerTool: (tool: Record<string, unknown>) => {
@@ -202,23 +247,24 @@ function createHarness(): Harness {
 			lastActiveTools = names;
 		},
 		getActiveTools: (): string[] => [],
-		getAllTools: () => [
-			...registered.map((t) => ({
-				name: t.name,
-				label: t.label,
-				description: t.description,
-				parameters: t.parameters,
-				promptGuidelines: t.promptGuidelines,
-			})),
-			{
-				name: FAKE_TOOL_NAME,
-				label: "Fake Discover",
-				description: "Fake OpenAaaS-like tool used by lazy-tools integration tests.",
-				parameters: FAKE_TOOL_SCHEMA,
-				promptGuidelines: [],
-				sourceInfo: { path: FIXTURE_SOURCE },
-			},
-		],
+		getAllTools: () =>
+			[
+				...registered.map((t) => ({
+					name: t.name,
+					label: t.label,
+					description: t.description,
+					parameters: t.parameters,
+					promptGuidelines: t.promptGuidelines,
+				})),
+				{
+					name: FAKE_TOOL_NAME,
+					label: "Fake Discover",
+					description: "Fake OpenAaaS-like tool used by lazy-tools integration tests.",
+					parameters: FAKE_TOOL_SCHEMA,
+					promptGuidelines: [],
+					sourceInfo: { path: FIXTURE_SOURCE },
+				},
+			].filter((t) => !(hideOmnifyFromRegistry && t.name === OMNIFY_NAME)),
 		on: (event: string, handler: SessionHandler | BeforeAgentStartHandler) => {
 			if (event === "session_start") sessionHandlers.push(handler as SessionHandler);
 			else if (event === "before_agent_start")
@@ -242,6 +288,35 @@ function createHarness(): Harness {
 		"standalone load_tools / call_tool / skill_search must not be registered anymore",
 	);
 
+	// 默认架空 HOME：用户级 settings.json / 旧 lazy-tools.json 必须由本 harness 决定，
+	// 否则会读到开发者真实机器上的配置。freshUserHome: false 可显式关闭。
+	async function runInIsolatedHome(
+		options: BootOptions,
+		fn: () => Promise<void>,
+	): Promise<void> {
+		if (options.freshUserHome === false) {
+			await fn();
+			return;
+		}
+		const originalHome = process.env.HOME;
+		const originalProfile = process.env.USERPROFILE;
+		const tempUserHome = mkdtempSync(join(tmpdir(), "lazy-tools-home-"));
+		process.env.HOME = tempUserHome;
+		process.env.USERPROFILE = tempUserHome;
+		userHome = tempUserHome;
+		userSettingsPath = join(tempUserHome, ".pi", "agent", "settings.json");
+		writeUserSettings(tempUserHome, options.userDefaultTools);
+		try {
+			await fn();
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalProfile;
+			rmSync(tempUserHome, { recursive: true, force: true });
+		}
+	}
+
 	return {
 		async boot(residentNames: string[] = [], options: BootOptions = {}): Promise<void> {
 			resetGlobalCounters();
@@ -249,37 +324,23 @@ function createHarness(): Harness {
 			setActiveToolsCalls = 0;
 			lastActiveTools = undefined;
 			userHome = undefined;
+			userSettingsPath = undefined;
+			hideOmnifyFromRegistry = options.hideOmnifyFromRegistry ?? false;
 			workspace = reInitWorkspace(residentNames, options);
-
-			const originalHome = process.env.HOME;
-			const originalProfile = process.env.USERPROFILE;
-			let tempUserHome: string | undefined;
-			if (options.freshUserHome) {
-				tempUserHome = mkdtempSync(join(tmpdir(), "lazy-tools-home-"));
-				process.env.HOME = tempUserHome;
-				process.env.USERPROFILE = tempUserHome;
-				userHome = tempUserHome;
-			}
-
-			try {
-				await fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace, options);
-			} finally {
-				if (tempUserHome !== undefined) {
-					if (originalHome === undefined) delete process.env.HOME;
-					else process.env.HOME = originalHome;
-					if (originalProfile === undefined) delete process.env.USERPROFILE;
-					else process.env.USERPROFILE = originalProfile;
-					rmSync(tempUserHome, { recursive: true, force: true });
-				}
-			}
+			await runInIsolatedHome(options, () =>
+				fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace!, options),
+			);
 		},
 		reboot(residentNames: string[] = [], options: BootOptions = {}): Promise<void> {
 			// 与 boot 共享同一扩展实例（闭包缓存不重建），仅重新触发 session_start
 			notifyCalls.length = 0;
 			setActiveToolsCalls = 0;
 			lastActiveTools = undefined;
+			hideOmnifyFromRegistry = options.hideOmnifyFromRegistry ?? false;
 			workspace = reInitWorkspace(residentNames, options);
-			return fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace, options);
+			return runInIsolatedHome(options, () =>
+				fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace!, options),
+			);
 		},
 		cleanup(): void {
 			if (workspace) rmSync(workspace, { recursive: true, force: true });
@@ -304,6 +365,9 @@ function createHarness(): Harness {
 		},
 		getUserHomePath(): string | undefined {
 			return userHome;
+		},
+		getUserSettingsPath(): string | undefined {
+			return userSettingsPath;
 		},
 		getRegisteredTool(name: string): Record<string, unknown> | undefined {
 			return registered.find((t) => t.name === name);
@@ -606,7 +670,7 @@ describe("omnify (技能检索分支)", () => {
 
 describe("lazy-tools startup notice (session_start)", () => {
 	// C1: boot 后恰好通知一次；名单 + 生效配置路径
-	it("should notify the tool list and the effective project config path once on session_start", async () => {
+	it("should notify the tool list and the effective project settings path once on session_start", async () => {
 		await withHarness([], async (h) => {
 			const calls = h.getNotifyCalls();
 			assert.equal(calls.length, 1, "session_start should call ctx.ui.notify exactly once");
@@ -614,12 +678,20 @@ describe("lazy-tools startup notice (session_start)", () => {
 			const text = calls[0].text;
 			assert.ok(text.includes("当前 lazy 工具名单："), `notice should have the list header; got: ${text}`);
 			assert.ok(text.includes(FAKE_TOOL_NAME), `notice should list ${FAKE_TOOL_NAME}; got: ${text}`);
-			// omnify 常驻，不入 lazy 名单
-			assert.ok(!text.includes("omnify"), `resident omnify must not appear in the lazy list; got: ${text}`);
+			// omnify 常驻，不入 lazy 名单（只查名单区段，后文会提到 omnify）
+			const lazySection = text.slice(0, text.indexOf("当前常驻名单"));
+			assert.ok(
+				!lazySection.includes("omnify"),
+				`resident omnify must not appear in the lazy list; got: ${lazySection}`,
+			);
 
 			const workspacePath = h.getWorkspacePath();
 			assert.ok(workspacePath, "harness should own a temp workspace");
-			const projectPath = join(workspacePath, ".pi", "lazy-tools.json");
+			const projectPath = join(workspacePath, ".pi", "settings.json");
+			assert.ok(
+				text.includes("当前常驻名单（settings.json 的 defaultTools）："),
+				`notice should have the resident header; got: ${text}`,
+			);
 			assert.ok(
 				text.includes("当前生效的配置文件为："),
 				`notice should mark the effective config; got: ${text}`,
@@ -635,15 +707,71 @@ describe("lazy-tools startup notice (session_start)", () => {
 		});
 	});
 
-	it("should keep configured resident tools out of the lazy list", async () => {
+	it("should keep tools listed in defaultTools out of the lazy list", async () => {
 		await withHarness([FAKE_TOOL_NAME], async (h) => {
 			const text = h.getNotifyCalls()[0].text;
 			assert.ok(
-				!text.includes(FAKE_TOOL_NAME),
+				text.includes("当前 lazy 工具名单：\n（空）"),
 				`resident tool must be excluded from the lazy list; got: ${text}`,
 			);
-			assert.ok(text.includes("（空）"), `resident-only roster renders empty; got: ${text}`);
+			assert.ok(
+				text.includes(`- ${FAKE_TOOL_NAME}`),
+				`resident tool should be listed as resident instead; got: ${text}`,
+			);
 		});
+	});
+
+	// C2: defaultTools: [] → 除 omnify 外全量 lazy
+	it("should make every tool lazy when defaultTools is an empty array", async () => {
+		await withHarness([], async (h) => {
+			const text = h.getNotifyCalls()[0].text;
+			assert.ok(
+				text.includes(`- ${FAKE_TOOL_NAME}`),
+				`empty defaultTools means everything is lazy; got: ${text}`,
+			);
+			assert.ok(
+				text.includes("（空：除 omnify 外全部按需加载）"),
+				`notice should explain the empty resident list; got: ${text}`,
+			);
+			assert.ok(
+				text.includes("当前生效的配置文件为："),
+				`an explicit empty array is still a valid source; got: ${text}`,
+			);
+			assert.ok(
+				text.includes(join(h.getWorkspacePath()!, ".pi", "settings.json")),
+				`notice should point at the project settings; got: ${text}`,
+			);
+		});
+	});
+
+	// C3: 未信任的项目不得影响常驻名单（与 pi 自身忽略项目 settings 一致）
+	it("should ignore the project settings when the project is not trusted", async () => {
+		await withHarness([FAKE_TOOL_NAME], async (h) => {
+			const text = h.getNotifyCalls()[0].text;
+			assert.ok(
+				text.includes(`- ${FAKE_TOOL_NAME}`),
+				`untrusted project settings must not keep the tool resident; got: ${text}`,
+			);
+			assert.ok(
+				!text.includes("当前生效的配置文件为："),
+				`no settings file may be reported as effective; got: ${text}`,
+			);
+			assert.ok(
+				text.includes("当前未配置 defaultTools，取 pi 内置默认。"),
+				`untrusted project settings must fall back to the pi defaults; got: ${text}`,
+			);
+		}, { projectTrusted: false });
+	});
+
+	// C4: 用户级 defaultTools 在无项目级配置时生效
+	it("should fall back to the user-level defaultTools when the project has none", async () => {
+		await withHarness([], async (h) => {
+			const text = h.getNotifyCalls()[0].text;
+			assert.ok(
+				text.includes(h.getUserSettingsPath()!),
+				`notice should point at the user settings path; got: ${text}`,
+			);
+		}, { writeProjectSettings: false, userDefaultTools: [FAKE_TOOL_NAME] });
 	});
 
 	it("should skip notify for non-startup reasons but still run setActiveTools", async () => {
@@ -663,7 +791,7 @@ describe("lazy-tools startup notice (session_start)", () => {
 		}
 	});
 
-	it("should notify the no-config notice when neither user nor project config exists", async () => {
+	it("should notify the pi-default notice when no defaultTools is configured anywhere", async () => {
 		await withHarness([], async (h) => {
 			const calls = h.getNotifyCalls();
 			assert.equal(calls.length, 1, "session_start should notify once even without any config");
@@ -676,14 +804,46 @@ describe("lazy-tools startup notice (session_start)", () => {
 
 			assert.ok(text.includes(FAKE_TOOL_NAME), `default roster should list ${FAKE_TOOL_NAME}; got: ${text}`);
 			assert.ok(
-				text.includes("当前暂无配置文件："),
-				`notice should mark no-config; got: ${text}`,
+				text.includes("当前未配置 defaultTools，取 pi 内置默认。配置位置："),
+				`notice should mark the pi-default fallback; got: ${text}`,
 			);
 			assert.ok(
-				text.includes("\n\n以上两个文件均不存在"),
-				`notice should end with the both-missing line; got: ${JSON.stringify(text)}`,
+				text.includes(`用户级：${join(userHomePath, ".pi", "agent", "settings.json")}`),
+				`notice should list the user-level settings path; got: ${text}`,
 			);
-		}, { writeProjectConfig: false, freshUserHome: true });
+			assert.ok(
+				text.includes(`项目级：${join(workspacePath, ".pi", "settings.json")}`),
+				`notice should list the project-level settings path; got: ${text}`,
+			);
+			assert.ok(
+				text.includes("- read"),
+				`pi builtin defaults keep read resident; got: ${text}`,
+			);
+		}, { writeProjectSettings: false });
+	});
+
+	// C5: 旧版 lazy-tools.json 只告警不读取
+	it("should warn about a legacy lazy-tools.json without honouring it", async () => {
+		const warnings = await captureWarnings(async () => {
+			await withHarness([], async (h) => {
+				const text = h.getNotifyCalls()[0].text;
+				assert.ok(
+					text.includes(join(h.getWorkspacePath()!, ".pi", "settings.json")),
+					`the settings path must remain the effective source; got: ${text}`,
+				);
+			}, { writeLegacyConfig: true });
+		});
+
+		assert.ok(
+			warnings.some((args) =>
+				String(args[0]).includes("lazy-tools.json") && String(args[0]).includes("defaultTools"),
+			),
+			`a legacy config file should trigger a migration warning; got: ${JSON.stringify(warnings)}`,
+		);
+		assert.ok(
+			!warnings.some((args) => String(args[0]).includes("session_start handler failed")),
+			"the legacy file must not break session_start",
+		);
 	});
 
 	it("should skip notify silently when the session ctx has no ui", async () => {
@@ -724,6 +884,40 @@ describe("lazy-tools startup notice (session_start)", () => {
 			warnings.filter((args) => String(args[0]).includes("session_start handler failed")).length,
 			0,
 			"a throwing notify must not surface as a handler failure warning",
+		);
+	});
+
+	// omnify 不经 settings.json：无论 defaultTools 怎么写（含 []），它都常驻在 active 集里
+	it("should keep omnify active even when defaultTools is empty", async () => {
+		await withHarness([], async (h) => {
+			const active = h.getLastActiveTools() ?? [];
+			assert.ok(
+				active.includes(OMNIFY_NAME),
+				`omnify must be force-enabled regardless of defaultTools; got: ${JSON.stringify(active)}`,
+			);
+		});
+	});
+
+	// 启动参数（-t/--tools）把 omnify 移出注册表时：本会话不懒加载，只告警
+	it("should skip lazy loading and warn when omnify is not in the registry", async () => {
+		const warnings = await captureWarnings(async () => {
+			await withHarness([FAKE_TOOL_NAME], async (h) => {
+				assert.equal(
+					h.getSetActiveToolsCalls(),
+					0,
+					"session_start must not hide tools when the entry point is missing",
+				);
+				const text = h.getNotifyCalls()[0]?.text ?? "";
+				assert.ok(
+					text.includes("不在工具注册表"),
+					`the pruned-registry case should notify the user; got: ${text}`,
+				);
+			}, { hideOmnifyFromRegistry: true });
+		});
+
+		assert.ok(
+			warnings.some((args) => String(args[0]).includes("不在工具注册表")),
+			"the pruned-registry case should also warn on the console",
 		);
 	});
 });

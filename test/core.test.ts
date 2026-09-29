@@ -5,7 +5,7 @@
  *   /Users/liuyu/pi-workspace/pi-lazy-tools/lazy-tools/core.ts
  *
  * Contract under test (no pi runtime, no typebox imports):
- *   mergeLazyConfigs(userCfg, projectCfg)                -> { resident: string[] }
+ *   resolveDefaultTools(candidates, fallback?)     -> { resident, path }
  *   validateParams(schema, params)                       -> { ok, errors }
  *   buildStartupNotice(input)                            -> string
  */
@@ -13,11 +13,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-	mergeLazyConfigs,
+	resolveDefaultTools,
 	validateParams,
-	selectEffectiveConfigPath,
 	buildStartupNotice,
 	rankToolMatches,
+	PI_BUILTIN_DEFAULT_TOOLS,
 	StartupNoticeInput,
 } from "../lazy-tools/core.ts";
 
@@ -106,50 +106,84 @@ function expectErrors(result: { ok: boolean; errors: string[] }, ...fragments: s
 	}
 }
 
-// ===== mergeLazyConfigs =====
+// ===== resolveDefaultTools =====
 
-describe("mergeLazyConfigs", () => {
-	it("should return { resident: [] } when both configs are null (missing/corrupt files)", () => {
-		assert.deepEqual(mergeLazyConfigs(null, null), { resident: [] });
-	});
+describe("resolveDefaultTools", () => {
+	const PROJECT = "/work/demo/.pi/settings.json";
+	const USER = "/home/tester/.pi/agent/settings.json";
 
-	it("should fall back to user config when project config is null", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: ["a", "b"] }, null), { resident: ["a", "b"] });
-	});
-
-	it("should fall back to user config when project config has no resident array", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { other: 1 }), { resident: ["a"] });
-	});
-
-	it("should replace user config entirely when project config has a resident array", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: ["p1", "p2"] }), {
-			resident: ["p1", "p2"],
+	it("should fall back to pi's builtin defaults when no candidate has defaultTools", () => {
+		assert.deepEqual(resolveDefaultTools([{ path: PROJECT, defaultTools: undefined }]), {
+			resident: [...PI_BUILTIN_DEFAULT_TOOLS],
+			path: null,
 		});
 	});
 
-	it("should treat an empty resident array in project config as an explicit replace", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: [] }), { resident: [] });
+	it("should fall back to pi's builtin defaults when there are no candidates at all", () => {
+		assert.deepEqual(resolveDefaultTools([]), {
+			resident: ["read", "bash", "edit", "write"],
+			path: null,
+		});
 	});
 
-	it("should accept an empty resident array in user config when project is null", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: [] }, null), { resident: [] });
+	it("should honour an explicit fallback argument", () => {
+		assert.deepEqual(resolveDefaultTools([], []), { resident: [], path: null });
 	});
 
-	it("should treat a non-array lazy field as absent and fall back to user config", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: ["a"] }, { resident: "oops" }), { resident: ["a"] });
+	it("should use the first candidate that carries a valid defaultTools array", () => {
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: ["p1", "p2"] },
+				{ path: USER, defaultTools: ["u"] },
+			]),
+			{ resident: ["p1", "p2"], path: PROJECT },
+		);
 	});
 
-	it("should filter non-string entries out of the resident array", () => {
-		const project = { resident: ["a", 1, null, true, "b", { x: 1 }] };
-		assert.deepEqual(mergeLazyConfigs(null, project), { resident: ["a", "b"] });
+	it("should use the user candidate when the project one has no defaultTools", () => {
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: undefined },
+				{ path: USER, defaultTools: ["u"] },
+			]),
+			{ resident: ["u"], path: USER },
+		);
 	});
 
-	it("should return { resident: [] } when neither config has a valid resident array", () => {
-		assert.deepEqual(mergeLazyConfigs({ resident: 42 }, { other: "x" }), { resident: [] });
+	it("should treat an empty array as an explicit 'everything is lazy' value", () => {
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: [] },
+				{ path: USER, defaultTools: ["u"] },
+			]),
+			{ resident: [], path: PROJECT },
+		);
 	});
 
-	it("should return { resident: [] } for empty config objects", () => {
-		assert.deepEqual(mergeLazyConfigs({}, {}), { resident: [] });
+	it("should treat a non-array defaultTools as absent and keep looking", () => {
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: "oops" },
+				{ path: USER, defaultTools: ["u"] },
+			]),
+			{ resident: ["u"], path: USER },
+		);
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: 42 },
+				{ path: USER, defaultTools: null },
+			]),
+			{ resident: [...PI_BUILTIN_DEFAULT_TOOLS], path: null },
+		);
+	});
+
+	it("should filter non-string entries and drop duplicates", () => {
+		assert.deepEqual(
+			resolveDefaultTools([
+				{ path: PROJECT, defaultTools: ["a", 1, null, true, "b", { x: 1 }, "a"] },
+			]),
+			{ resident: ["a", "b"], path: PROJECT },
+		);
 	});
 });
 
@@ -358,93 +392,38 @@ describe("validateParams (review-driven regressions)", () => {
 	});
 });
 
-// ===== canCall =====
-
-describe("selectEffectiveConfigPath", () => {
-	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
-	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
-
-	// 项目级含有效 resident 数组（非空）→ 项目级，即使用户级同样有效
-	it("should pick the project path when the project config has a non-empty resident array", () => {
-		assert.equal(
-			selectEffectiveConfigPath({ resident: ["u"] }, { resident: ["p1", "p2"] }, USER_PATH, PROJECT_PATH),
-			PROJECT_PATH,
-		);
-	});
-
-	// 项目级空数组 → 仍算有效（显式覆盖用户级），返回项目级
-	it("should pick the project path when the project config has an empty resident array", () => {
-		assert.equal(
-			selectEffectiveConfigPath({ resident: ["u"] }, { resident: [] }, USER_PATH, PROJECT_PATH),
-			PROJECT_PATH,
-		);
-	});
-
-	// 项目级 lazy 非数组 → 视为无效，回退用户级
-	it("should fall back to the user path when the project lazy field is not an array", () => {
-		assert.equal(
-			selectEffectiveConfigPath({ resident: ["u"] }, { resident: "oops" }, USER_PATH, PROJECT_PATH),
-			USER_PATH,
-		);
-	});
-
-	// 项目级缺失（null）→ 回退用户级
-	it("should fall back to the user path when the project config is missing", () => {
-		assert.equal(
-			selectEffectiveConfigPath({ resident: ["u"] }, null, USER_PATH, PROJECT_PATH),
-			USER_PATH,
-		);
-	});
-
-	// 非字符串项被过滤但不影响数组本身的有效性（与 mergeLazyConfigs 同源）
-	it("should still treat the project array as valid when it contains non-string entries", () => {
-		const project = { resident: ["p", 1, null, true, { x: 1 }] };
-		assert.equal(
-			selectEffectiveConfigPath({ resident: ["u"] }, project, USER_PATH, PROJECT_PATH),
-			PROJECT_PATH,
-		);
-	});
-
-	// 两者皆无有效 resident 数组 → null
-	it("should return null when neither config has a valid resident array", () => {
-		assert.equal(
-			selectEffectiveConfigPath({ resident: 42 }, { other: "x" }, USER_PATH, PROJECT_PATH),
-			null,
-		);
-	});
-
-	// 两者全空/缺失 → null（与 mergeLazyConfigs 返回 { resident: [] } 的语义同源）
-	it("should return null when both configs are null or empty", () => {
-		assert.equal(selectEffectiveConfigPath(null, null, USER_PATH, PROJECT_PATH), null);
-		assert.equal(selectEffectiveConfigPath({}, {}, USER_PATH, PROJECT_PATH), null);
-	});
-});
-
 // ===== buildStartupNotice（新契约） =====
 
 describe("buildStartupNotice (新契约)", () => {
-	const USER_PATH = "/home/tester/.pi/lazy-tools.json";
-	const PROJECT_PATH = "/work/demo/.pi/lazy-tools.json";
+	const USER_PATH = "/home/tester/.pi/agent/settings.json";
+	const PROJECT_PATH = "/work/demo/.pi/settings.json";
 
 	function makeInput(overrides: Partial<StartupNoticeInput> = {}): StartupNoticeInput {
 		return {
 			toolNames: ["revive_subagent"],
-			userConfigPath: USER_PATH,
-			projectConfigPath: PROJECT_PATH,
-			effectiveConfigPath: PROJECT_PATH,
+			resident: ["read", "bash"],
+			sourcePath: PROJECT_PATH,
+			userSettingsPath: USER_PATH,
+			projectSettingsPath: PROJECT_PATH,
 			...overrides,
 		};
 	}
 
-	// 情况一（effectiveConfigPath 非 null）：名单 + 空行 + 「当前生效的配置文件为：」+ 生效路径
-	it("should state the effective config path after the tool list when a config is effective", () => {
+	// 情况一（sourcePath 非 null）：lazy 名单 + 常驻名单 + 「当前生效的配置文件为：」+ 生效路径
+	it("should state the effective settings path after the lists when defaultTools is configured", () => {
 		const text = buildStartupNotice(makeInput());
 
 		assert.ok(text.includes("当前 lazy 工具名单："), `notice should have the list header; got: ${text}`);
 		assert.ok(text.includes("- revive_subagent"), `notice should list the tool; got: ${text}`);
 		assert.ok(
+			text.includes("当前常驻名单（settings.json 的 defaultTools）："),
+			`notice should have the resident header; got: ${text}`,
+		);
+		assert.ok(text.includes("- read"), `notice should list resident tools; got: ${text}`);
+		assert.ok(text.includes("- bash"), `notice should list resident tools; got: ${text}`);
+		assert.ok(
 			text.includes("\n\n"),
-			`notice should separate the list and the config line with a blank line; got: ${JSON.stringify(text)}`,
+			`notice should separate blocks with blank lines; got: ${JSON.stringify(text)}`,
 		);
 		assert.ok(
 			text.includes("当前生效的配置文件为："),
@@ -454,7 +433,7 @@ describe("buildStartupNotice (新契约)", () => {
 	});
 
 	// 情况一：多工具 → 每个工具名逐行列出
-	it("should list every tool name on its own line when multiple tools are effective", () => {
+	it("should list every tool name on its own line when multiple tools are lazy", () => {
 		const text = buildStartupNotice(
 			makeInput({ toolNames: ["revive_subagent", "openaas", "git_mirror"] }),
 		);
@@ -469,8 +448,8 @@ describe("buildStartupNotice (新契约)", () => {
 		assert.ok(text.includes(PROJECT_PATH), `notice should mention the effective path; got: ${text}`);
 	});
 
-	// 情况一：空名单 → （空）标注，不列任何工具名
-	it("should mark an empty tool list with （空） when a config is effective", () => {
+	// 情况一：空 lazy 名单 → （空）标注
+	it("should mark an empty tool list with （空）", () => {
 		const text = buildStartupNotice(makeInput({ toolNames: [] }));
 
 		assert.ok(text.includes("（空）"), `notice should mark the empty list; got: ${text}`);
@@ -478,11 +457,20 @@ describe("buildStartupNotice (新契约)", () => {
 			text.includes("当前生效的配置文件为："),
 			`notice should still state the effective config; got: ${text}`,
 		);
-		assert.ok(text.includes(PROJECT_PATH), `notice should mention the effective path; got: ${text}`);
 	});
 
-	// 情况一：推翻旧契约的逐侧标注——只陈述生效路径，不列用户级/项目级位置
-	it("should not mention the user/project config locations individually when a config is effective", () => {
+	// 空常驻名单（defaultTools: []）→ 说明「除 omnify 外全部按需加载」
+	it("should spell out the fully-lazy meaning when the resident list is empty", () => {
+		const text = buildStartupNotice(makeInput({ resident: [] }));
+
+		assert.ok(
+			text.includes("（空：除 omnify 外全部按需加载）"),
+			`empty resident list should be explained; got: ${text}`,
+		);
+	});
+
+	// 情况一：只陈述生效路径，不列用户级/项目级位置
+	it("should not mention the user/project settings locations individually when a config is effective", () => {
 		const text = buildStartupNotice(makeInput());
 
 		assert.ok(
@@ -495,14 +483,16 @@ describe("buildStartupNotice (新契约)", () => {
 		);
 	});
 
-	// 情况二（effectiveConfigPath 为 null）：双路径分别列出 + 空行 + 「以上两个文件均不存在」，名单为（空）
-	it("should list both config locations and the both-missing notice when nothing is effective", () => {
-		const text = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+	// 情况二（sourcePath 为 null）：说明取 pi 内置默认 + 双路径配置位置
+	it("should list both settings locations and the pi-default notice when defaultTools is absent", () => {
+		const text = buildStartupNotice(
+			makeInput({ toolNames: [], resident: ["read", "bash", "edit", "write"], sourcePath: null }),
+		);
 
 		assert.ok(text.includes("（空）"), `notice should mark the empty list; got: ${text}`);
 		assert.ok(
-			text.includes("当前暂无配置文件："),
-			`notice should mark no-config; got: ${text}`,
+			text.includes("当前未配置 defaultTools，取 pi 内置默认。配置位置："),
+			`notice should mark the pi-default fallback; got: ${text}`,
 		);
 		assert.ok(
 			text.includes(`用户级：${USER_PATH}`),
@@ -512,15 +502,11 @@ describe("buildStartupNotice (新契约)", () => {
 			text.includes(`项目级：${PROJECT_PATH}`),
 			`notice should list the project-level path; got: ${text}`,
 		);
-		assert.ok(
-			text.includes("\n\n以上两个文件均不存在"),
-			`notice should end with a blank line and the both-missing line; got: ${JSON.stringify(text)}`,
-		);
 	});
 
-	// 情况二：无生效路径时不得出现「当前生效的配置文件为：」
-	it("should not claim an effective config when the effective path is null", () => {
-		const text = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+	// 情况二：不得出现「当前生效的配置文件为：」
+	it("should not claim an effective config when no defaultTools is configured", () => {
+		const text = buildStartupNotice(makeInput({ sourcePath: null }));
 
 		assert.ok(
 			!text.includes("当前生效的配置文件为："),
@@ -531,7 +517,7 @@ describe("buildStartupNotice (新契约)", () => {
 	// 措辞禁令：两种情况都不得包含「当前激活」「如需修改」「路径都没有找到」
 	it("should never contain any banned phrasing (当前激活 / 如需修改 / 路径都没有找到)", () => {
 		const case1 = buildStartupNotice(makeInput());
-		const case2 = buildStartupNotice(makeInput({ toolNames: [], effectiveConfigPath: null }));
+		const case2 = buildStartupNotice(makeInput({ sourcePath: null }));
 
 		for (const text of [case1, case2]) {
 			assert.ok(!text.includes("当前激活"), `banned phrase 当前激活; got: ${text}`);
