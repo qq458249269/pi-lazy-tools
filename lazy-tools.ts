@@ -24,6 +24,7 @@ import {
 	validateParams,
 	buildStartupNotice,
 	rankToolMatches,
+	nonLoadableSourceReason,
 	type DefaultToolsCandidate,
 } from "./lazy-tools/core.ts";
 
@@ -34,6 +35,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 const jiti = createJiti(import.meta.url);
 
 const OMNIFY_NAME = "omnify";
+
+/** 内建工具执行不了时的统一提示（挂在失败文案尾部）。 */
+const BUILTIN_ONLY_HINT =
+	"\n提示：omnify 只能执行扩展注册的工具；内建工具（read/bash/edit/write/ls/powershell/grep/find）"
+	+ "请直接用常驻工具调用。";
+
 
 /** pi 的 agent 目录（settings.json 所在处）；pi 以 PI_CODING_AGENT_DIR 覆盖。 */
 const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
@@ -328,8 +335,11 @@ export default function (pi: ExtensionAPI) {
 
 			// c. 有 args：逐候选校验并试调，成功即返。
 			const reasons: string[] = [];
+			let sawNonLoadable = false;
 			for (const name of matched) {
 				const info = toolMap.get(name)!;
+				// 过了参数校验 = 该候选就是最佳匹配，它一失败就最终失败（见 catch 里的 break）。
+				let validated = false;
 				try {
 					const validation = validateParams(info.parameters, params.args);
 					if (!validation.ok) {
@@ -339,6 +349,15 @@ export default function (pi: ExtensionAPI) {
 						// 指名场景：即返该工具要求，勿代为猜试其他工具。
 						if (explicit) break;
 						continue;
+					}
+					validated = true;
+
+					// 内建工具没有可 import 的源码（合成 sourceInfo）：说清原因并停下。
+					const notLoadable = nonLoadableSourceReason(info);
+					if (notLoadable) {
+						sawNonLoadable = true;
+						reasons.push(`- ${name}: ${notLoadable}`);
+						break;
 					}
 
 					const sourcePath = info.sourceInfo?.path;
@@ -360,6 +379,11 @@ export default function (pi: ExtensionAPI) {
 					};
 				} catch (err) {
 					reasons.push(`- ${name}: ${err instanceof Error ? err.message : String(err)}`);
+					// 关键修复：候选一旦过了参数校验并开始执行，它就是最佳匹配，失败即最终失败。
+					// 旧实现无条件 continue 到下一个候选 → 会「静默执行错工具并冒充成功」：
+					// schema 宽松的工具（如 mcp 的 Record<string,unknown>）照单全收，然后返回
+					// 「MCP: 0/0 servers, 0 tools」这种看着正常的空结果。
+					if (explicit || validated) break;
 				}
 			}
 
@@ -368,7 +392,8 @@ export default function (pi: ExtensionAPI) {
 				...reasons,
 				explicit
 					? "请按上方参数要求补参重试，或以常规手段完成。"
-					: "请以常规手段（bash/read/编辑）完成，或以 tool 参数显式指名工具重试。",
+					: "请以常规手段（bash/read/编辑）完成，或以 tool 参数显式指名工具重试。"
+						+ (sawNonLoadable ? BUILTIN_ONLY_HINT : ""),
 			].join("\n");
 			return {
 				content: [{ type: "text", text: text + renderSkillHits(params.goal) }],

@@ -18,6 +18,7 @@ import {
 	buildStartupNotice,
 	rankToolMatches,
 	PI_BUILTIN_DEFAULT_TOOLS,
+	nonLoadableSourceReason,
 	StartupNoticeInput,
 } from "../lazy-tools/core.ts";
 
@@ -556,5 +557,39 @@ describe("rankToolMatches", () => {
 	it("should return no hits for an empty or whitespace goal", () => {
 		assert.deepEqual(rankToolMatches("", TOOLS), []);
 		assert.deepEqual(rankToolMatches("   ", TOOLS), []);
+	});
+});
+
+describe("nonLoadableSourceReason", () => {
+	it("should reject pi builtin tools carrying a synthetic <sdk:name> source", () => {
+		const reason = nonLoadableSourceReason({
+			sourceInfo: { path: "<sdk:ls>", source: "sdk" },
+		});
+		assert.ok(reason);
+		assert.match(reason, /omnify 执行不了/);
+		assert.match(reason, /bash/);
+	});
+
+	it("should also reject the older <builtin:name> marker and source=builtin", () => {
+		const reason = nonLoadableSourceReason({
+			sourceInfo: { path: "<builtin:ls>", source: "builtin" },
+		});
+		assert.ok(reason);
+	});
+
+	it("should report a missing source path instead of silently returning null", () => {
+		assert.match(nonLoadableSourceReason({ sourceInfo: { path: "" } }) ?? "", /缺少来源路径/);
+		assert.match(nonLoadableSourceReason(undefined) ?? "", /缺少来源路径/);
+	});
+
+	it("should allow extension tools that have a real file path", () => {
+		assert.equal(
+			nonLoadableSourceReason({ sourceInfo: { path: "C:/pi/extensions/pi-fd.ts", source: "local" } }),
+			null,
+		);
+		assert.equal(
+			nonLoadableSourceReason({ sourceInfo: { path: "/home/u/.pi/agent/extensions/pi-fd.ts" } }),
+			null,
+		);
 	});
 });

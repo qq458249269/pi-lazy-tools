@@ -291,3 +291,30 @@ export function rankToolMatches(goal: string, toolInfos: ToolInfoLike[]): string
 		.sort((a, b) => b.score - a.score);
 	return scored.map((s) => s.name);
 }
+
+/** omnify 取 ToolInfo 时用到的最小来源信息（pi 的 SourceInfo 子集）。 */
+export interface ToolSourceLike {
+	path?: string;
+	source?: string;
+}
+
+/**
+ * 判断某个候选工具的定义能否用「重新 import 源文件」的方式取到；不能时给出可直接
+ * 转达给模型的中文原因（null = 可以加载）。
+ *
+ * pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）不是扩展模块：它们由 pi
+ * 自己的工厂函数（createLsTool(cwd, options) 之类）造出来，sourceInfo 是**合成标记**
+ * ——path 形如 `<sdk:ls>` / `<builtin:ls>`，source 为 `sdk` / `builtin`。对这种路径做
+ * jiti.import 必然抛错，旧实现只报一句「执行定义加载失败」，模型看不出该换手段。
+ */
+export function nonLoadableSourceReason(info: { sourceInfo?: ToolSourceLike } | undefined): string | null {
+	const source = info?.sourceInfo;
+	const path = source?.path ?? "";
+	if (!path) return "缺少来源路径（sourceInfo.path 为空），omnify 无法定位其定义";
+	const synthetic = source?.source === "sdk" || source?.source === "builtin" || /^<[^>]*>$/.test(path);
+	if (synthetic) {
+		const kind = source?.source ?? "内置";
+		return `${kind}工具（sourceInfo=${path}，由 pi 内部工厂生成、没有可 import 的源码）→ omnify 执行不了；请直接用常驻的 bash / powershell 等工具完成`;
+	}
+	return null;
+}
