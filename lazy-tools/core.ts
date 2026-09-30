@@ -21,6 +21,11 @@ export interface StartupNoticeInput {
 	toolNames: string[];
 	/** 常驻（不 lazy）工具名。 */
 	resident: string[];
+	/**
+	 * omnify 无法代理执行、因而强制常驻的内建/sdk 工具名（默认 []）。
+	 * 与 `resident` 可能重复；重复展示是为了说明「配置里没写，为什么它还在场上」。
+	 */
+	forcedResident?: string[];
 	/** 提供 defaultTools 的 settings.json 路径；null = 未配置，取 pi 内置默认。 */
 	sourcePath: string | null;
 	userSettingsPath: string;
@@ -205,13 +210,27 @@ export function buildStartupNotice(input: StartupNoticeInput): string {
 	lines.push("");
 	lines.push("当前常驻名单（settings.json 的 defaultTools）：");
 	if (input.resident.length === 0) {
-		lines.push("（空：除 omnify 外全部按需加载）");
+		lines.push(
+			input.forcedResident && input.forcedResident.length > 0
+				? "（空：defaultTools 未列工具）"
+				: "（空：除 omnify 外全部按需加载）",
+		);
 	} else {
 		for (const name of input.resident) {
 			lines.push(`- ${name}`);
 		}
 	}
 	lines.push("");
+
+	// 内建/sdk 工具没有可重放的源码，omnify 调不动，故不会被 lazy 隐藏；
+	// defaultTools: [] 时还会把内建基线补回常驻，单独列出以免用户困惑。
+	if (input.forcedResident && input.forcedResident.length > 0) {
+		lines.push("以下内建工具 omnify 无法代理，强制常驻（与 defaultTools 无关）：");
+		for (const name of input.forcedResident) {
+			lines.push(`- ${name}`);
+		}
+		lines.push("");
+	}
 
 	if (input.sourcePath !== null) {
 		lines.push("当前生效的配置文件为：");

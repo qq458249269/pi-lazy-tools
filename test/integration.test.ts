@@ -69,11 +69,16 @@ type SessionHandler = (
 	},
 ) => void | Promise<void>;
 
-/** before_agent_start handler 的最小形态（扩展消费 systemPrompt、systemPromptOptions.skills 与 sections）。 */
+/** before_agent_start handler 的最小形态（扩展消费 systemPrompt、systemPromptOptions.skills/sections 与工具 prompt 元数据）。 */
 type BeforeAgentStartHandler = (
 	event: {
 		systemPrompt: string;
-		systemPromptOptions: { skills?: unknown[]; sections?: Record<string, string> };
+		systemPromptOptions: {
+			skills?: unknown[];
+			sections?: Record<string, string>;
+			toolSnippets?: Record<string, string>;
+			toolGuidelines?: Record<string, string[]>;
+		};
 	},
 ) => { systemPrompt?: string } | void;
 
@@ -108,6 +113,11 @@ interface BootOptions {
 	 * （pi 的 -t/--tools 对未列名工具就是这么干的）。
 	 */
 	hideOmnifyFromRegistry?: boolean;
+	/**
+	 * 是否在 getAllTools() 里加入 pi 内建工具（合成 <builtin:name> sourceInfo）。
+	 * 用于验证「omnify 无法代理的内建工具强制常驻、且不进 omnify 搜索池」。
+	 */
+	includeBuiltins?: boolean;
 }
 
 interface Harness {
@@ -229,6 +239,7 @@ function createHarness(): Harness {
 	let userHome: string | undefined;
 	let userSettingsPath: string | undefined;
 	let hideOmnifyFromRegistry = false;
+	let includeBuiltins = false;
 
 	const fakePi = {
 		registerTool: (tool: Record<string, unknown>) => {
@@ -256,6 +267,46 @@ function createHarness(): Harness {
 					parameters: t.parameters,
 					promptGuidelines: t.promptGuidelines,
 				})),
+				...(includeBuiltins
+					? [
+						{
+							name: "read",
+							label: "read",
+							description: "Read the contents of a file.",
+							parameters: {
+								type: "object",
+								properties: { path: { type: "string" } },
+								required: ["path"],
+							},
+							promptGuidelines: [],
+							sourceInfo: { path: "<builtin:read>", source: "builtin" },
+						},
+						{
+							name: "bash",
+							label: "bash",
+							description: "Execute a bash command in the current working directory.",
+							parameters: {
+								type: "object",
+								properties: { command: { type: "string" } },
+								required: ["command"],
+							},
+							promptGuidelines: [],
+							sourceInfo: { path: "<builtin:bash>", source: "builtin" },
+						},
+						{
+							name: "grep",
+							label: "grep",
+							description: "Search file contents.",
+							parameters: {
+								type: "object",
+								properties: { pattern: { type: "string" } },
+								required: ["pattern"],
+							},
+							promptGuidelines: [],
+							sourceInfo: { path: "<builtin:grep>", source: "builtin" },
+						},
+					]
+					: []),
 				{
 					name: FAKE_TOOL_NAME,
 					label: "Fake Discover",
@@ -326,6 +377,7 @@ function createHarness(): Harness {
 			userHome = undefined;
 			userSettingsPath = undefined;
 			hideOmnifyFromRegistry = options.hideOmnifyFromRegistry ?? false;
+			includeBuiltins = options.includeBuiltins ?? false;
 			workspace = reInitWorkspace(residentNames, options);
 			await runInIsolatedHome(options, () =>
 				fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace!, options),
@@ -337,6 +389,7 @@ function createHarness(): Harness {
 			setActiveToolsCalls = 0;
 			lastActiveTools = undefined;
 			hideOmnifyFromRegistry = options.hideOmnifyFromRegistry ?? false;
+			includeBuiltins = options.includeBuiltins ?? false;
 			workspace = reInitWorkspace(residentNames, options);
 			return runInIsolatedHome(options, () =>
 				fireSessionStartHandlers(sessionHandlers, notifyCalls, workspace!, options),
@@ -898,6 +951,37 @@ describe("lazy-tools startup notice (session_start)", () => {
 		});
 	});
 
+	// omnify 不能代理内建/sdk 工具（无可重放源码）→ 即使 defaultTools: [] 也强制常驻，
+	// 否则它们被隐藏后 omnify 也调不动，session 直接残废。
+	it("should force-keep builtin tools active even when defaultTools is empty", async () => {
+		await withHarness([], async (h) => {
+			const active = h.getLastActiveTools() ?? [];
+			assert.ok(active.includes("bash"), `bash must stay active; got: ${JSON.stringify(active)}`);
+			assert.ok(active.includes("read"), `read must stay active; got: ${JSON.stringify(active)}`);
+			assert.ok(
+				!active.includes("grep"),
+				`optional builtins must not be force-activated; got: ${JSON.stringify(active)}`,
+			);
+
+			const text = h.getNotifyCalls()[0].text;
+			const forcedHeader = "以下内建工具 omnify 无法代理，强制常驻（与 defaultTools 无关）：";
+			const forcedIdx = text.indexOf(forcedHeader);
+			assert.ok(forcedIdx > -1, `notice should explain the forced builtins; got: ${text}`);
+			assert.ok(
+				text.indexOf("- bash") > forcedIdx,
+				`bash may only show up in the forced-resident section; got: ${text}`,
+			);
+			assert.ok(
+				!text.includes("- grep"),
+				`optional builtins must not be advertised as forced resident; got: ${text}`,
+			);
+			assert.ok(
+				text.indexOf(`- ${FAKE_TOOL_NAME}`) < forcedIdx,
+				`extension tools should stay in the lazy list; got: ${text}`,
+			);
+		}, { includeBuiltins: true });
+	});
+
 	// 启动参数（-t/--tools）把 omnify 移出注册表时：本会话不懒加载，只告警
 	it("should skip lazy loading and warn when omnify is not in the registry", async () => {
 		const warnings = await captureWarnings(async () => {
@@ -919,6 +1003,111 @@ describe("lazy-tools startup notice (session_start)", () => {
 			warnings.some((args) => String(args[0]).includes("不在工具注册表")),
 			"the pruned-registry case should also warn on the console",
 		);
+	});
+});
+
+describe("omnify 与 pi 内建工具", () => {
+	// 显式指名内建工具：不返 schema-first（参数摘要）钓鱼，直接说清并引导原生调用
+	it("should refuse to proxy an explicitly named builtin instead of returning its schema", async () => {
+		await withHarness([], async (h) => {
+			const result = (await h.omnify({ goal: "bash", tool: "bash" })) as {
+				content: Array<{ type: string; text: string }>;
+				details: { ok: boolean; phase?: string };
+			};
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.ok(text.includes("内建工具"), `should explain bash is builtin; got: ${text}`);
+			assert.ok(text.includes("直接调用 bash"), `should point at native bash; got: ${text}`);
+			assert.ok(
+				!text.includes("参数要求"),
+				`schema-first must not be offered for a builtin; got: ${text}`,
+			);
+			assert.equal(result.details.phase, "builtin");
+			assert.equal(result.details.ok, false);
+		}, { includeBuiltins: true });
+	});
+
+	// 内建工具不得进入 omnify 搜索池/名录（它们本就直接可用，列出来只会诱导错误调用）
+	it("should keep builtins out of omnify's candidate list and roster", async () => {
+		await withHarness([], async (h) => {
+			const result = (await h.omnify({ goal: "bash" })) as {
+				content: Array<{ type: string; text: string }>;
+			};
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.ok(!text.includes("- bash"), `bash must not be a candidate; got: ${text}`);
+			assert.ok(!text.includes("bash:"), `bash schema must not be surfaced; got: ${text}`);
+		}, { includeBuiltins: true });
+	});
+
+	// 指名一个未启用的内建工具：给出「加入 defaultTools 重开」的可执行指引，而非空谈「直接调用」
+	it("should tell the model how to enable a disabled builtin instead of a dead end", async () => {
+		await withHarness(["read"], async (h) => {
+			const result = (await h.omnify({ goal: "bash", tool: "bash" })) as {
+				content: Array<{ type: string; text: string }>;
+			};
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.ok(text.includes("未启用"), `should say bash is disabled; got: ${text}`);
+			assert.ok(
+				text.includes("defaultTools"),
+				`should point at the config knob; got: ${text}`,
+			);
+		}, { includeBuiltins: true });
+	});
+
+	// 本扩展主动补回的内建工具（defaultTools: [] 时的基线）不得用自身 promptSnippet/
+	// promptGuidelines 改写系统提示词——否则「启用工具」本身就在动缓存前缀。
+	it("should strip forced-resident builtins' own prompt metadata so enabling them cannot move the cache prefix", async () => {
+		await withHarness([], async (h) => {
+			const options = {
+				skills: [],
+				sections: { rules: "old", docs: "old" },
+				toolSnippets: {
+					read: "- read: read files",
+					bash: "- bash: run commands",
+					omnify: "- omnify: search tools",
+				},
+				toolGuidelines: {
+					read: ["read carefully"],
+					bash: ["quote paths"],
+					omnify: ["try omnify first"],
+				},
+			};
+			h.fireBeforeAgentStart(options, "base-prompt");
+			assert.ok(
+				!("read" in options.toolSnippets),
+				`forced read snippet must be stripped; got: ${JSON.stringify(options.toolSnippets)}`,
+			);
+			assert.ok(
+				!("bash" in options.toolSnippets),
+				`forced bash snippet must be stripped; got: ${JSON.stringify(options.toolSnippets)}`,
+			);
+			assert.ok(
+				"omnify" in options.toolSnippets,
+				`omnify's own snippet must survive; got: ${JSON.stringify(options.toolSnippets)}`,
+			);
+			assert.ok(
+				!("read" in options.toolGuidelines) && !("bash" in options.toolGuidelines),
+				`forced guidelines must be stripped; got: ${JSON.stringify(options.toolGuidelines)}`,
+			);
+			assert.ok(
+				"omnify" in options.toolGuidelines,
+				`omnify's own guidelines must survive; got: ${JSON.stringify(options.toolGuidelines)}`,
+			);
+		}, { includeBuiltins: true });
+	});
+
+	// 用户经 defaultTools 显式启用的内建工具属于 pi 的启动基线，本扩展不得擅自剥其元数据。
+	it("should leave builtin prompt metadata alone when the user enabled them via defaultTools", async () => {
+		await withHarness(["read", "bash"], async (h) => {
+			const options = {
+				skills: [],
+				sections: {},
+				toolSnippets: { read: "- read", bash: "- bash" },
+				toolGuidelines: { bash: ["quote paths"] },
+			};
+			h.fireBeforeAgentStart(options, "base-prompt");
+			assert.ok("read" in options.toolSnippets && "bash" in options.toolSnippets);
+			assert.ok("bash" in options.toolGuidelines);
+		}, { includeBuiltins: true });
 	});
 });
 

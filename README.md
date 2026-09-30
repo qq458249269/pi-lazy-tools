@@ -35,7 +35,7 @@ lazy-tools/
 ├── lazy-tools.ts        # 扩展入口：配置读取、session_start、omnify 单常驻
 ├── lazy-tools/
 │   └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
-└── test/                # 72 个测试（node:test + tsx）
+└── test/                # 84 个测试（node:test + tsx）
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -52,7 +52,7 @@ typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 nod
 
 ### 最小配置
 
-常驻名单（不 lazy 的例外工具）不再由扩展自建文件，而是**与 pi 共用 `settings.json` 的 `defaultTools` 字段**：一处配置，pi 决定首轮 active 集，本扩展决定谁被懒加载，两边永远一致。默认无任何字段时沿用 pi 内置默认（`read`、`bash`、`edit`、`write`）；写空数组即全量 lazy：除单入口 `omnify` 常驻外，全部已装工具按需加载。技能清单同样不入系统提示词，由 omnify 检索并返回其 SKILL.md 路径；会话启动还会把系统提示词的 `rules`/`docs` 两节压缩成要点版（语义要点不变），进一步削减首请求 token。
+会话启动还会把系统提示词的 `rules`/`docs` 两节压缩成要点版（语义要点不变），进一步削减首请求 token。空名单补回的内建基线属于「本扩展主动启用」，其 `promptSnippet`/`promptGuidelines` 会在会话启动后从系统提示词中剥除——工具照常可调用，但其自述不进入前缀，启用动作因此不改变缓存前缀。
 
 ```jsonc
 // ~/.pi/agent/settings.json（项目级为 <cwd>/.pi/settings.json）
@@ -61,7 +61,7 @@ typebox：扩展直接 import typebox（pi 运行时同款，位于根目录 nod
 }
 ```
 
-`defaultTools` 里写始终常驻、不参与 lazy 的工具名（内置工具与扩展工具都认）；其余工具全部按需加载，名单取舍标准见[挑选要 lazy 化的工具](#挑选要-lazy-化的工具)。想让全部工具按需加载：
+`defaultTools` 里写始终常驻、不参与 lazy 的工具名（内置工具与扩展工具都认）；其余工具全部按需加载，名单取舍标准见[挑选要 lazy 化的工具](#挑选要-lazy-化的工具)。想让全部扩展工具按需加载（内建工具仍强制常驻）：
 
 ```jsonc
 { "defaultTools": [] }
@@ -99,6 +99,8 @@ omnify 是唯常驻入口，四合一（原 load_tools / call_tool / skill_searc
 | 匹配 + 无 `args` | schema-first：返回候选工具的参数 JSON Schema，补 args 重试 |
 | 匹配 + 有 `args` | Schema 预校验后执行，成功即返结果 |
 | `tool` 显式指名 | 跳过搜索直接评估该工具；参数不符即止，不代猜其他工具 |
+| `tool` 指名内建工具 | 不代理：告知其为内建工具并引导原生调用；若该内建工具未启用，则提示加入 `defaultTools` 并重开会话 |
+| goal 只命中内建工具 | 不进候选；返扩展工具名录 + 技能命中，引导直接用常驻工具 |
 
 匹配规则：目标名精确/包含优先，其次目标词（英文整词 + 中文双字去虚词）与 description 的交集，取前 5 个候选依次试调。目标 execute 由 findToolDefinition 重放捕获：以伪造 pi 重放目标扩展 factory，截获其 ToolDefinition（含真实 execute），按 `${sourcePath}#${name}` memoize（每工具每会话只重放一次 factory），随后以原始参数、signal、onUpdate、ctx 调用，结果原样返回。
 
@@ -145,7 +147,7 @@ Schema 预校验支持 type / required / enum / pattern / properties / additiona
 项目级：<cwd>/.pi/settings.json
 ```
 
-`defaultTools: []` 时常驻名单为空，名单区段标为「（空：除 omnify 外全部按需加载）」。
+`defaultTools: []` 时常驻名单区段标为「（空：defaultTools 未列工具）」，并额外列出被补回常驻的内建基线（如上面的 `read`、`bash`、`edit`、`write`）以及说明「与 defaultTools 无关」。
 
 提示只做告知，不影响核心逻辑：名单剔除与 setActiveTools 照常执行；`ctx.ui.notify` 不可用或抛错时静默跳过（仅 console.warn），不打断会话。
 
@@ -158,7 +160,7 @@ Schema 预校验支持 type / required / enum / pattern / properties / additiona
 | 用户级 | `~/.pi/agent/settings.json` | 所有项目的默认名单 |
 | 项目级 | `<cwd>/.pi/settings.json` | 会话工作目录下的 .pi 目录，覆盖用户级（需项目受信任） |
 
-字段：`defaultTools: string[]`，示例：`{ "defaultTools": ["read", "bash"] }`，即 pi 官方文档里的「Built-in tools enabled at startup」；扩展工具写进去同样生效（写了就常驻）。
+字段：`defaultTools: string[]`，示例：`{ "defaultTools": ["read", "bash"] }`，即 pi 官方文档里的「Built-in tools enabled at startup」；扩展工具写进去同样生效（写了就常驻）。注意：内建工具永远不能被 lazy（omnify 代理不了），写进来只是把它置为常驻/active；若某个内建工具既不在名单里也没赶上空名单基线，它就不可用。
 
 解析规则：
 
@@ -210,7 +212,7 @@ prompt cache 按前缀匹配：请求序列化后，与上一轮共享的前缀�
 本设计对两者的处理：
 
 - tools 字段只在 session_start 写一次（首轮请求前），此后冻结
-- 系统提示词全程不变：lazy 工具从不激活，promptGuidelines 结构性不会进入系统提示词
+- 系统提示词全程不变：lazy 工具从不激活，`promptSnippet`/`promptGuidelines` 结构性不会进入系统提示词；即便是 `defaultTools: []` 时本扩展主动补回的常驻内建基线，其 `promptSnippet`/`promptGuidelines` 也会被 `before_agent_start` 剥除，启用它不改变前缀
 
 会话内的消息增长全部发生在消息流末尾：omnify 的 schema-first 用法与其执行结果都是追加内容，追加不改变前缀。结论：本设计在任何模型、任何 provider 上，懒加载不造成任何一次缓存失效。
 
@@ -245,9 +247,11 @@ pi-lazy-extensions 按扩展粒度懒加载：jiti 动态 import 整个扩展模
 
 本设计优化的是每轮请求的上下文构成：低频工具的定义每轮都在场，随会话变长、重试增多而复利占用主 Agent 的注意力。因此粒度必须到单个工具，同一个扩展里的工具可以部分隐藏，`defaultTools` 名单里精确到工具名。
 
-#### 为什么不需要剥离系统提示词里的 guidelines
+#### 为什么（几乎）不需要剥离系统提示词里的工具元数据
 
-promptGuidelines 只在工具 active 时进入系统提示词。本设计的工具从不激活，tools 字段里始终没有它们，guidelines 结构性不会出现在系统提示词里，没有需要剥离的内容。这是「永不激活」路线自动获得的缓存红利，也是坑 3 那条经验的反面。
+`promptSnippet`/`promptGuidelines` 只在工具 active 时才进入系统提示词。本设计的 lazy 目标工具从不激活，tools 字段里始终没有它们，元数据结构性不会出现在系统提示词里，无需剥离。这是「永不激活」路线自动获得的缓存红利，也是坑 3 那条经验的反面。
+
+唯一的例外是本扩展自己补启的常驻内建基线（`defaultTools: []` 时的 `read`/`bash`/`edit`/`write`）：它们确实被写进 active 集，pi 会顺手把其 prompt 元数据并进系统提示词。`before_agent_start` 因此把这批工具从 `toolSnippets`/`toolGuidelines` 中剔除——工具照常在 tools 字段里可调用，但其自述绝不进入系统提示词，前缀与本扩展是否补启了它无关。用户经 `defaultTools` 显式启用的内建工具不算例外：那是 pi 的启动基线，其元数据原样保留。
 
 ### 踩过的坑
 
@@ -255,7 +259,7 @@ promptGuidelines 只在工具 active 时进入系统提示词。本设计的工�
 
 按 pi 0.87.x 的实现（`dist/core/sdk.js` → `allowedToolNames = options.tools ?? (noTools === "all" ? [] : undefined)`，注册表按 `isAllowedTool()` 过滤），`--tools` 不是无条件白名单：
 
-- **不传任何工具参数**（裸 `pi.exe`）→ `allowedToolNames` 为 undefined，注册表不过滤。`getAllTools()` 返回全部内置工具（含默认不 active 的 grep/find/ls/powershell）与全部扩展工具，omnify 都能搜到、能执行。裸启动反而是最省事的情形。
+- **不传任何工具参数**（裸 `pi.exe`）→ `allowedToolNames` 为 undefined，注册表不过滤。`getAllTools()` 返回全部内置工具（含默认不 active 的 grep/find/ls/powershell）与全部扩展工具。扩展工具 omnify 能搜到、能执行；内建工具只用于判定「必须常驻」，绝不进搜索池（见坑 7）。裸启动反而是最省事的情形。
 - **`-t/--tools a,b`** → `allowedToolNames` 变成白名单，注册表只剩列出的名字，其余 omnify 搜不到。
 - **`-nt/--no-tools`** → `allowedToolNames=[]`，注册表清空，只剩 omnify 自己。
 - **`-xt/--exclude-tools X`** → X 从注册表剔除，omnify 搜不到。
@@ -269,7 +273,7 @@ promptGuidelines 只在工具 active 时进入系统提示词。本设计的工�
 
 #### 3. promptGuidelines 会随工具激活重建系统提示词
 
-setActiveTools 激活一个带 promptGuidelines 的工具，系统提示词整体重建；即使 provider 支持原生 deferred schema，这个变化照样前缀失效。官方文档明确提示 lazy 工具应省略 prompt 元数据。对任何 setActiveTools 方案这都是隐藏的缓存杀手；本设计从不激活，天然绕开。
+setActiveTools 激活一个带 promptGuidelines 的工具，系统提示词整体重建；即使 provider 支持原生 deferred schema，这个变化照样前缀失效。官方文档明确提示 lazy 工具应省略 prompt 元数据。对任何 setActiveTools 方案这都是隐藏的缓存杀手；本设计从不激活，天然绕开。本扩展唯一主动激活的常驻内建基线也做了处理：激活后在 `before_agent_start` 里剥掉其 prompt 元数据（见[为什么（几乎）不需要剥离系统提示词里的工具元数据](#为什么几乎不需要剥离系统提示词里的工具元数据)）。
 
 #### 4. pi 会吞掉 session_start handler 的异常
 
@@ -285,6 +289,14 @@ session_start 里抛异常，pi 静默吞掉，表现为工具没被隐藏、名
 - required / properties 不能被 `type: "object"` 门控：合法 schema 可以省略 type，缺 type 时 object 分支的校验也要走
 - `"key" in obj` 会被 `__proto__` 原型链欺骗：属主属性判断必须用 `Object.hasOwn`
 - 没有 additionalProperties 约束时多余字段默认放行，这是真实 TypeBox 形态，不要画蛇添足地报错
+
+#### 7. 内建工具不能经 omnify 调用（否则死路）
+
+omnify 的执行是「重新 import 目标扩展源码 → 重放 factory → 截获真实 execute」。pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）由 pi 内部工厂生成，`getAllTools()` 里其 `sourceInfo.path` 是 `<builtin:name>` 合成标记、没有可 import 的源码；`createAgentSession({ customTools })` 注入的工具走 `<sdk:name>` 同理，重放必然失败。
+
+旧实现把内建工具也算进搜索池与名录，于是：模型按 goal 搜到 bash、拿到 `{ command:string! }` 的 schema-first 摘要、补参重试，然后收到「执行不了」——而失败文案还说「请按上方参数要求补参重试」，把模型往「参数不对」的方向带（反复改参数、反复失败）。更糟的是 `defaultTools: []` 时 bash 已被本扩展隐藏，「请直接用常驻的 bash」根本无从落实。
+
+非空名单完全尊重用户配置，不擅自增补。空名单补回的内建基线属于本扩展主动激活，其 `promptSnippet`/`promptGuidelines` 会在 `before_agent_start` 里剥除，工具可调用但其自述不进系统提示词，启用动作不改变缓存前缀。教训：代理执行器能执行什么，搜索池就只能放什么。
 
 ### 已知风险与维护
 
@@ -314,7 +326,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 
 ## 开发
 
-测试位于 `test/`，72 个用例（46 单元 + 26 集成）：
+测试位于 `test/`，84 个用例（52 单元 + 32 集成）：
 
 ```bash
 cd pi-lazy-tools
@@ -323,7 +335,7 @@ npm test            # node --import tsx --test test/core.test.ts test/integratio
 npm run typecheck   # tsc --noEmit（严格模式）
 ```
 
-覆盖：配置合并、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、omnify 四合一接线（schema-first 零执行、显式指名、参数错误不执行、factory memoize、技能命中返 SKILL.md 路径）。集成测试真实加载扩展源码。
+覆盖：配置合并、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、omnify 四合一接线（schema-first 零执行、显式指名、参数错误不执行、factory memoize、技能命中返 SKILL.md 路径、内建工具不进搜索池/强制常驻、显式指名内建工具返回可执行说明、启用内建基线时剥除其 prompt 元数据）。集成测试真实加载扩展源码。
 
 ## License
 

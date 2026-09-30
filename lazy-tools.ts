@@ -25,6 +25,7 @@ import {
 	buildStartupNotice,
 	rankToolMatches,
 	nonLoadableSourceReason,
+	PI_BUILTIN_DEFAULT_TOOLS,
 	type DefaultToolsCandidate,
 } from "./lazy-tools/core.ts";
 
@@ -245,6 +246,13 @@ function matchSkills(goal: string, skills: SkillMeta[]): SkillMeta[] {
 export default function (pi: ExtensionAPI) {
 	let lazyNames: string[] = [];
 	let lazySet = new Set<string>();
+	// session_start 后真正生效的 active 集（pi.getActiveTools() 在部分运行时/测试桩里
+	// 不反映 setActiveTools 的结果，故以本扩展算出的落地集为准）。
+	let activeAfterSetup = new Set<string>();
+	// 本扩展主动塞回 active 集的工具（defaultTools: [] 时的内建基线）。启用它们会让
+	// pi 把其 promptSnippet/promptGuidelines 并进系统提示词；before_agent_start 里须
+	// 把这批工具的 prompt 元数据剔除，否则「启用工具」本身就在动缓存前缀。
+	let forcedResidentNames: string[] = [];
 	let skills: SkillMeta[] = [];
 	// session 级：schema-first 摘要按工具缓存；成功执行过的工具不再重复展示摘要
 	const summaryCache = new Map<string, string>();
@@ -274,6 +282,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"无 args：返候选参数要求，补 args 重试。",
 			"失败：按明细补参/指名重试，或退常规手段。",
+			"内建工具（read/bash/edit/write/ls/powershell/grep/find）不经 omnify，直接调用。",
 		],
 		parameters: OmnifyParams,
 
@@ -284,21 +293,52 @@ export default function (pi: ExtensionAPI) {
 				.getAllTools()
 				.filter((t) => typeof t.name === "string" && typeof t.description === "string");
 			const toolMap = new Map(allTools.map((t) => [t.name, t]));
+			// omnify 只能代理执行扩展工具（findToolDefinition 重放源码）。pi 内建/sdk 工具的
+			// sourceInfo 是 <builtin:name>/<sdk:name> 合成标记，没有可 import 的源码：它们
+			// 若进入候选，模型就会拿到一个永远失败的调用（旧实现反而回「按参数要求补参重试」，
+			// 把模型往错方向带）。这里把它们从搜索池与名录里彻底剔除——它们不经 omnify，
+			// 模型直接调用即可（session_start 也不会把它们放进 lazy 名单）。
+			const omnifiable = allTools.filter((t) => nonLoadableSourceReason(t) === null);
+
+			// 显式指名内建工具：不返参数摘要，也不试跑，直接说清并引导原生调用。
+			if (explicit) {
+				const named = toolMap.get(params.tool as string);
+				if (named && named.name !== OMNIFY_NAME && nonLoadableSourceReason(named) !== null) {
+					const name = params.tool as string;
+					// 内建工具本不在搜索池（模型本就能直接调），走到这里多半是它没启用。
+					const isActive = activeAfterSetup.has(name);
+					const text = isActive
+						? `"${name}" 是内建工具，omnify 不能代理执行（无可重放源码）；请直接调用 ${name}。`
+						: `"${name}" 是内建工具且当前未启用，omnify 也无法代理执行。若确实需要，请把 "${name}" 加入 settings.json 的 defaultTools 并重开会话。`;
+					return {
+						content: [{ type: "text", text }],
+						details: { ok: false, phase: "builtin", matched: [] },
+					};
+				}
+			}
 
 			const candidates = explicit
 				? [params.tool as string]
-				: rankToolMatches(params.goal, allTools).slice(0, 5);
+				: rankToolMatches(params.goal, omnifiable).slice(0, 5);
 			// omnify 自身不入候选（防自调）。
 			const matched = candidates.filter((name) => toolMap.has(name) && name !== OMNIFY_NAME);
 
-			// a. 零匹配：全部工具名录 + 技能命中，引导指名或退常规。
+			// a. 零匹配：扩展工具名录 + 技能命中，引导指名或退常规。
 			if (matched.length === 0) {
-				const roster = [...toolMap.entries()].map(([n, t]) => `- ${n}: ${t.description}`).join("\n");
+				const roster = omnifiable
+					.filter((t) => t.name !== OMNIFY_NAME)
+					.map((t) => `- ${t.name}: ${t.description}`)
+					.join("\n");
+				// 内建工具不在名录里（模型本就看得见、直接可用），故可能一个扩展工具都没有。
+				const rosterSection =
+					roster.length > 0
+						? `可经 omnify 调用的扩展工具：\n${roster}`
+						: "当前没有可经 omnify 调用的扩展工具（内建工具不经 omnify，请直接调用）。";
 				const text =
-					`未找到与目标相关之工具/技能。可用工具：\n${roster}${renderSkillHits(params.goal)}\n` +
+					`未找到与目标相关之工具/技能。${rosterSection}${renderSkillHits(params.goal)}\n` +
 					(explicit
 						? `工具 "${params.tool}" 不存在。`
-						: "请以 tool 参数指名其一补 args 重试，或以 bash/read/编辑 等常规手段完成。");
+						: "请直接使用常驻工具（bash/read/编辑等）完成，或以 tool 参数指名扩展工具补 args 重试。");
 				return {
 					content: [{ type: "text", text }],
 					details: { ok: false, matched: [], reasons: [] },
@@ -390,10 +430,11 @@ export default function (pi: ExtensionAPI) {
 			const text = [
 				`omnify 尝试 ${matched.length} 个候选工具均未成功：`,
 				...reasons,
-				explicit
-					? "请按上方参数要求补参重试，或以常规手段完成。"
-					: "请以常规手段（bash/read/编辑）完成，或以 tool 参数显式指名工具重试。"
-						+ (sawNonLoadable ? BUILTIN_ONLY_HINT : ""),
+				sawNonLoadable
+					? BUILTIN_ONLY_HINT.trim()
+					: explicit
+						? "请按上方参数要求补参重试，或以常规手段完成。"
+						: "请以常规手段（bash/read/编辑）完成，或以 tool 参数显式指名工具重试。",
 			].join("\n");
 			return {
 				content: [{ type: "text", text: text + renderSkillHits(params.goal) }],
@@ -405,7 +446,14 @@ export default function (pi: ExtensionAPI) {
 	// pi 0.84.x 无 sections 字段：须回传整串 systemPrompt 方能生效（每轮均触发）。
 	pi.on("before_agent_start", (event) => {
 		skills = event.systemPromptOptions.skills ?? [];
-		const { sections } = event.systemPromptOptions;
+		const { sections, toolSnippets, toolGuidelines } = event.systemPromptOptions;
+		// 先剥掉 forcedResident 工具自身的 prompt 元数据（pi 0.86+ 会据 options 重建 sections，
+		// 改动由此生效）。工具仍在 tools 字段里可调用，但其自述（snippet/guidelines）绝不进入
+		// 系统提示词——前缀与「本扩展是否补启了它」无关，杜绝启用动作经工具自身改写缓存前缀。
+		for (const name of forcedResidentNames) {
+			delete toolSnippets[name];
+			delete toolGuidelines[name];
+		}
 		if (sections) {
 			// 0.86+：只改 section，pi 仅在内容变化时记 transcript delta，轮间字节稳定（前缀缓存不散）
 			if (skills.length > 0) sections.skills = SKILLS_NOTE;
@@ -447,12 +495,12 @@ export default function (pi: ExtensionAPI) {
 			// omnify 是常驻入口，不经 settings.json：这里无条件把它写进 active 集。
 			// 但它必须先在注册表里（-t/--tools 会把未列名工具移出注册表），
 			// 否则本会话若照常隐藏其余工具就没有取用入口——此时不懒加载，只告警。
-			const allToolNames = pi
-				.getAllTools()
-				.map((tool) => tool.name);
+			const allTools = pi.getAllTools();
+			const allToolNames = allTools.map((tool) => tool.name);
 			if (!allToolNames.includes(OMNIFY_NAME)) {
 				lazyNames = [];
 				lazySet = new Set();
+				forcedResidentNames = [];
 				const message =
 					`[lazy-tools] ${OMNIFY_NAME} 不在工具注册表（启动参数裁剪了搜索池），` +
 					`本会话不做懒加载。裸 pi.exe 启动即可恢复。`;
@@ -467,7 +515,30 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const resident = new Set([OMNIFY_NAME, ...resolved.resident]);
+			// omnify 只能代理扩展工具（重放源码）；内建/sdk 工具没有可 import 的源码，调不动。
+			// 记下这批工具：它们绝不进 lazy 名单（active 的原样保留，inactive 的不强拉）。
+			const nonOmnifiable = new Set(
+				allTools
+					.filter((tool) => tool.name !== OMNIFY_NAME && nonLoadableSourceReason(tool) !== null)
+					.map((tool) => tool.name),
+			);
+			// defaultTools: [] 会让 pi 首轮一个工具都不激活；若照单全收，read/bash/edit/write
+			// 既不在场上、omnify 又代理不了，会话直接不可用。故空名单按「扩展工具全 lazy，
+			// pi 内建基线仍常驻」解释。非空名单完全尊重用户配置，不擅自增补。
+			const baselineFallback =
+				resolved.resident.length === 0
+					? PI_BUILTIN_DEFAULT_TOOLS.filter(
+							(name) => allToolNames.includes(name) && nonOmnifiable.has(name),
+						)
+					: [];
+			const forcedResident = baselineFallback;
+			forcedResidentNames = forcedResident;
+			const resident = new Set([
+				OMNIFY_NAME,
+				...resolved.resident,
+				...baselineFallback,
+				...nonOmnifiable,
+			]);
 			lazyNames = allToolNames.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
 			definitionCache.clear();
@@ -476,6 +547,7 @@ export default function (pi: ExtensionAPI) {
 			const notice = buildStartupNotice({
 				toolNames: lazyNames,
 				resident: resolved.resident,
+				forcedResident,
 				sourcePath: resolved.path,
 				userSettingsPath,
 				projectSettingsPath,
@@ -483,8 +555,11 @@ export default function (pi: ExtensionAPI) {
 
 			const active = pi.getActiveTools();
 			const filtered = active.filter((toolName) => !lazySet.has(toolName));
-			const initial = [...new Set([...filtered, OMNIFY_NAME])];
+			// forcedResident 要显式补回 active 集：defaultTools: [] 时 pi 首轮一个内建
+			// 工具都没激活，光「不隐藏」不够，还得把基线内建加回来。
+			const initial = [...new Set([...filtered, OMNIFY_NAME, ...forcedResident])];
 			pi.setActiveTools(initial);
+			activeAfterSetup = new Set(initial);
 
 			if (event?.reason === "startup") {
 				try {

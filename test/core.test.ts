@@ -470,6 +470,34 @@ describe("buildStartupNotice (新契约)", () => {
 		);
 	});
 
+	// 强制常驻的内建工具：单独一节，与 defaultTools 名单区分，说明为何它们还在场上
+	it("should list forced-resident builtins in their own section", () => {
+		const text = buildStartupNotice(
+			makeInput({ resident: [], forcedResident: ["read", "bash"] }),
+		);
+
+		assert.ok(
+			text.includes("以下内建工具 omnify 无法代理，强制常驻（与 defaultTools 无关）："),
+			`notice should explain the forced builtins; got: ${text}`,
+		);
+		assert.ok(text.includes("- read"), `notice should list read; got: ${text}`);
+		assert.ok(text.includes("- bash"), `notice should list bash; got: ${text}`);
+		assert.ok(
+			text.includes("（空：defaultTools 未列工具）"),
+			`empty defaultTools must not claim「除 omnify 外全部按需加载」when builtins are forced resident; got: ${text}`,
+		);
+	});
+
+	// 未传 forcedResident（缺省）时不得多出小节，保证既有契约不变
+	it("should omit the forced-resident section when the field is absent", () => {
+		const text = buildStartupNotice(makeInput());
+
+		assert.ok(
+			!text.includes("强制常驻"),
+			`no forced section without the field; got: ${text}`,
+		);
+	});
+
 	// 情况一：只陈述生效路径，不列用户级/项目级位置
 	it("should not mention the user/project settings locations individually when a config is effective", () => {
 		const text = buildStartupNotice(makeInput());
