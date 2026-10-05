@@ -39,7 +39,7 @@ const OMNIFY_NAME = "omnify";
 
 /** 内建工具执行不了时的统一提示（挂在失败文案尾部）。 */
 const BUILTIN_ONLY_HINT =
-	"\n提示：omnify 只能执行扩展注册的工具；内建工具（read/bash/edit/write/ls/powershell/grep/find）"
+	"\n提示：omnify 只能执行扩展注册的工具；内建工具（read/bash/edit/write/ls/powershell/grep）"
 	+ "请直接用常驻工具调用。";
 
 
@@ -283,7 +283,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"无 args：返候选参数要求，补 args 重试。",
 			"失败：按明细补参/指名重试，或退常规手段。",
-			"内建工具（read/bash/edit/write/ls/powershell/grep/find）不经 omnify，直接调用。",
+"内建工具（read/bash/edit/write/ls/powershell/grep）不经 omnify，直接调用。",
 		],
 		parameters: OmnifyParams,
 

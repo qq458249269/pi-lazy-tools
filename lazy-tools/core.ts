@@ -374,7 +374,7 @@ export interface ToolSourceLike {
  * 判断某个候选工具的定义能否用「重新 import 源文件」的方式取到；不能时给出可直接
  * 转达给模型的中文原因（null = 可以加载）。
  *
- * pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）不是扩展模块：它们由 pi
+* pi 内建工具（read/bash/edit/write/ls/powershell/grep）不是扩展模块：它们由 pi
  * 自己的工厂函数（createLsTool(cwd, options) 之类）造出来，sourceInfo 是**合成标记**
  * ——path 形如 `<sdk:ls>` / `<builtin:ls>`，source 为 `sdk` / `builtin`。对这种路径做
  * jiti.import 必然抛错，旧实现只报一句「执行定义加载失败」，模型看不出该换手段。
