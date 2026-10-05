@@ -65,14 +65,15 @@ const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按
  * 注意：pi 会自行给 section 内容包 `<rules>`/`</rules>` 标签，故此处放裸文本，勿自带标签（否则双嵌套）。
  */
 const RULES_NOTE =
-	"- 文件操作用 bash (ls, rg, find)；读文件用 read。\n" +
+	"- 文件操作用 bash (ls, rg, fd)；读文件用 read。\n" +
 	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
 	"- 新文件/整体重写用 write。\n" +
 	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
 	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
 
+// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\agent\pi
 const DOCS_NOTE =
-	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 docs/ 与 examples/（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
+	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\agent\\pi\\README.md；副档 D:\\agent\\pi\\docs 与 D:\\agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
 
 /** pi 的 agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`。 */
 function getAgentDir(): string {

@@ -18,9 +18,10 @@ import {
 	buildStartupNotice,
 	rankToolMatches,
 	PI_BUILTIN_DEFAULT_TOOLS,
-	nonLoadableSourceReason,
-	StartupNoticeInput,
+nonLoadableSourceReason,
 } from "../lazy-tools/core.ts";
+// 类型导出：node 原生类型擦除（无 tsx）不保留 type-only 导出，故须 import type。
+import type { StartupNoticeInput } from "../lazy-tools/core.ts";
 
 // ===== Shared fixtures =====
 
@@ -582,9 +583,33 @@ describe("rankToolMatches", () => {
 		assert.deepEqual(rankToolMatches("量子物理引力波", TOOLS), []);
 	});
 
-	it("should return no hits for an empty or whitespace goal", () => {
+it("should return no hits for an empty or whitespace goal", () => {
 		assert.deepEqual(rankToolMatches("", TOOLS), []);
 		assert.deepEqual(rankToolMatches("   ", TOOLS), []);
+	});
+
+	// 回归：拉丁2-gram与英文虚词（by/name）曾把长描述的 md_* 工具顶到 fd 前面。
+	it("should rank the file-search tool above markdown tools on a file goal", () => {
+		const NOISY = [
+			{
+				name: "md_edit",
+				description:
+					"Edit a markdown file (.md only) by section heading and block index. Call md_inspect first to find the right section and block_index.",
+			},
+			{ name: "fd", description: "Find files/directories by regex over the path (fd)." },
+		];
+assert.equal(rankToolMatches("按名字查找文件 find files by name", NOISY)[0], "fd");
+	});
+
+	// 中文 goal 靠 CN→EN 同义词桥命中英文描述；短拉丁词（ls 藏在 calls 里）不该入候选。
+	it("should bridge Chinese goals to English descriptions and reject incidental short words", () => {
+		const POOL = [
+			{ name: "fd", description: "Find files/directories by regex over the path (fd). Optional: changedWithin/maxDepth/hidden." },
+			{ name: "mcp", description: "MCP gateway - URL installation, server status, tool search/describe, and single MCP tool calls." },
+		];
+		assert.deepEqual(rankToolMatches("列出目录", POOL), ["fd"]);
+		assert.deepEqual(rankToolMatches("查找最近修改过的文件", POOL)[0], "fd");
+		assert.deepEqual(rankToolMatches("ls", POOL), []);
 	});
 });
 
