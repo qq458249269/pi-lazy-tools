@@ -259,7 +259,7 @@ pi-lazy-extensions 按扩展粒度懒加载：jiti 动态 import 整个扩展模
 
 按 pi 0.87.x 的实现（`dist/core/sdk.js` → `allowedToolNames = options.tools ?? (noTools === "all" ? [] : undefined)`，注册表按 `isAllowedTool()` 过滤），`--tools` 不是无条件白名单：
 
-- **不传任何工具参数**（裸 `pi.exe`）→ `allowedToolNames` 为 undefined，注册表不过滤。`getAllTools()` 返回全部内置工具（含默认不 active 的 grep/find/ls/powershell）与全部扩展工具。扩展工具 omnify 能搜到、能执行；内建工具只用于判定「必须常驻」，绝不进搜索池（见坑 7）。裸启动反而是最省事的情形。
+（含默认不 active 的 grep/find/ls/powershell；本机 `find` 已被 no-find 禁用，文件搜索走 fd）
 - **`-t/--tools a,b`** → `allowedToolNames` 变成白名单，注册表只剩列出的名字，其余 omnify 搜不到。
 - **`-nt/--no-tools`** → `allowedToolNames=[]`，注册表清空，只剩 omnify 自己。
 - **`-xt/--exclude-tools X`** → X 从注册表剔除，omnify 搜不到。
@@ -292,7 +292,7 @@ session_start 里抛异常，pi 静默吞掉，表现为工具没被隐藏、名
 
 #### 7. 内建工具不能经 omnify 调用（否则死路）
 
-omnify 的执行是「重新 import 目标扩展源码 → 重放 factory → 截获真实 execute」。pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）由 pi 内部工厂生成，`getAllTools()` 里其 `sourceInfo.path` 是 `<builtin:name>` 合成标记、没有可 import 的源码；`createAgentSession({ customTools })` 注入的工具走 `<sdk:name>` 同理，重放必然失败。
+pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）由 pi 内部工厂生成
 
 旧实现把内建工具也算进搜索池与名录，于是：模型按 goal 搜到 bash、拿到 `{ command:string! }` 的 schema-first 摘要、补参重试，然后收到「执行不了」——而失败文案还说「请按上方参数要求补参重试」，把模型往「参数不对」的方向带（反复改参数、反复失败）。更糟的是 `defaultTools: []` 时 bash 已被本扩展隐藏，「请直接用常驻的 bash」根本无从落实。
 
