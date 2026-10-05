@@ -66,6 +66,7 @@ const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按
  */
 const RULES_NOTE =
 	"- 文件操作用 bash (ls, rg, fd)；读文件用 read。\n" +
+	"- 查文件/目录一律优先 fd（omnify 检索或直接调 fd 工具）；禁用 find（会假死，已被 no-find 拦）。\n" +
 	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
 	"- 新文件/整体重写用 write。\n" +
 	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
