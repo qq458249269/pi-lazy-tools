@@ -292,7 +292,7 @@ session_start 里抛异常，pi 静默吞掉，表现为工具没被隐藏、名
 
 #### 7. 内建工具不能经 omnify 调用（否则死路）
 
-pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）由 pi 内部工厂生成
+omnify 的执行是「重新 import 目标扩展源码 → 重放 factory → 截获真实 execute」。pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）由 pi 内部工厂生成，`getAllTools()` 里其 `sourceInfo.path` 是 `<builtin:name>` 合成标记、没有可 import 的源码；`createAgentSession({ customTools })` 注入的工具走 `<sdk:name>` 同理，重放必然失败。
 
 旧实现把内建工具也算进搜索池与名录，于是：模型按 goal 搜到 bash、拿到 `{ command:string! }` 的 schema-first 摘要、补参重试，然后收到「执行不了」——而失败文案还说「请按上方参数要求补参重试」，把模型往「参数不对」的方向带（反复改参数、反复失败）。更糟的是 `defaultTools: []` 时 bash 已被本扩展隐藏，「请直接用常驻的 bash」根本无从落实。
 
