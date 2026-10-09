@@ -19,6 +19,9 @@ import {
 	rankToolMatches,
 	PI_BUILTIN_DEFAULT_TOOLS,
 	nonLoadableSourceReason,
+	resolveCompanionGroups,
+	planGroupActivation,
+	AUTO_COMPANION_GROUP_MAX,
 	StartupNoticeInput,
 } from "../lazy-tools/core.ts";
 
@@ -619,5 +622,153 @@ describe("nonLoadableSourceReason", () => {
 			nonLoadableSourceReason({ sourceInfo: { path: "/home/u/.pi/agent/extensions/pi-fd.ts" } }),
 			null,
 		);
+	});
+});
+
+describe("必备组件组（companion groups）", () => {
+	const subagentTools = [
+		{ name: "subagent", sourcePath: "pkg/subagent/index.ts" },
+		{ name: "subagent_status", sourcePath: "pkg/subagent/index.ts" },
+		{ name: "subagent_result", sourcePath: "pkg/subagent/index.ts" },
+		{ name: "await_subagent", sourcePath: "pkg/subagent/index.ts" },
+	];
+
+	it("should turn a one-way declaration into a shared group for every member", () => {
+		const groups = resolveCompanionGroups({
+			tools: subagentTools,
+			configured: { subagent: ["subagent_status", "subagent_result"] },
+		});
+		// 只声明了 subagent → 另外两个成员也必须能带出整组，否则模型先点名 status 就落单。
+		assert.deepEqual(groups.get("subagent")?.members, [
+			"subagent",
+			"subagent_result",
+			"subagent_status",
+		]);
+		assert.deepEqual(groups.get("subagent_status")?.members, groups.get("subagent")?.members);
+		assert.equal(groups.get("subagent_status")?.key, groups.get("subagent")?.key);
+	});
+
+	it("should follow transitive declarations into one group", () => {
+		const groups = resolveCompanionGroups({
+			tools: subagentTools,
+			configured: { subagent: ["subagent_status"], subagent_status: ["await_subagent"] },
+		});
+		assert.deepEqual(groups.get("await_subagent")?.members, [
+			"await_subagent",
+			"subagent",
+			"subagent_status",
+		]);
+	});
+
+	it("should drop companions that are not in the registry instead of forming a broken group", () => {
+		const groups = resolveCompanionGroups({
+			tools: [{ name: "subagent", sourcePath: "pkg/x.ts" }],
+			configured: { subagent: ["subagent_status"] },
+		});
+		assert.equal(groups.size, 0);
+	});
+
+	it("should ignore singleton and self-referential declarations", () => {
+		const groups = resolveCompanionGroups({
+			tools: subagentTools,
+			configured: { subagent: ["subagent"], subagent_status: [] },
+		});
+		assert.equal(groups.size, 0);
+	});
+
+	it("should group by source path only when auto mode is on", () => {
+		const withoutAuto = resolveCompanionGroups({ tools: subagentTools });
+		assert.equal(withoutAuto.size, 0);
+
+		const withAuto = resolveCompanionGroups({ tools: subagentTools, auto: true });
+		assert.equal(withAuto.get("subagent")?.members.length, 4);
+		assert.equal(withAuto.get("await_subagent")?.key, withAuto.get("subagent")?.key);
+	});
+
+	it("should refuse to auto-group oversized packages", () => {
+		const many = Array.from({ length: AUTO_COMPANION_GROUP_MAX + 1 }, (_, i) => ({
+			name: `mcp_tool_${i}`,
+			sourcePath: "pkg/big/index.ts",
+		}));
+		assert.equal(resolveCompanionGroups({ tools: many, auto: true }).size, 0);
+	});
+
+	it("should activate the whole group in one plan, skipping already-active members", () => {
+		const groups = resolveCompanionGroups({
+			tools: subagentTools,
+			configured: { subagent: ["subagent_status", "subagent_result"] },
+		});
+		const group = groups.get("subagent")!;
+		const registered = new Set(subagentTools.map((t) => t.name));
+		const planned = planGroupActivation({ group, registered, active: new Set(["subagent_status"]) });
+		assert.equal(planned.ok, true);
+		assert.ok(planned.ok && planned.plan.toActivate.length === 2);
+		assert.ok(planned.ok && !planned.plan.toActivate.includes("subagent_status"));
+	});
+
+	it("should be a no-op plan when the group is already fully active", () => {
+		const groups = resolveCompanionGroups({ tools: subagentTools, auto: true });
+		const group = groups.get("subagent")!;
+		const registered = new Set(subagentTools.map((t) => t.name));
+		const planned = planGroupActivation({
+			group,
+			registered,
+			active: new Set(subagentTools.map((t) => t.name)),
+		});
+		assert.ok(planned.ok && planned.plan.toActivate.length === 0);
+	});
+
+	it("should refuse the whole group when any member is missing from the registry", () => {
+		const groups = resolveCompanionGroups({ tools: subagentTools, auto: true });
+		const group = groups.get("subagent")!;
+		const planned = planGroupActivation({
+			group,
+			registered: new Set(["subagent", "subagent_status"]),
+			active: new Set<string>(),
+		});
+		assert.equal(planned.ok, false);
+		assert.match(planned.ok ? "" : planned.reason, /必备组件未注册.*await_subagent/);
+	});
+});
+
+describe("companion 组：是否需要声明（exposure 感知）", () => {
+	const tools = [
+		{ name: "subagent", sourcePath: "pkg/subagent/index.ts" },
+		{ name: "subagent_status", sourcePath: "pkg/subagent/index.ts" },
+	];
+
+	it("should mark a normal group as needing declaration", () => {
+		const group = resolveCompanionGroups({ tools, configured: { subagent: ["subagent_status"] } }).get(
+			"subagent",
+		);
+		assert.equal(group?.needsDeclaration, true);
+	});
+
+	it("should not require declaration when every member is codemode/deferred", () => {
+		const group = resolveCompanionGroups({
+			tools,
+			configured: { subagent: ["subagent_status"] },
+			alwaysCallable: ["subagent", "subagent_status"],
+		}).get("subagent");
+		assert.equal(group?.needsDeclaration, false);
+	});
+
+	it("should still require declaration when only part of the group is always callable", () => {
+		const group = resolveCompanionGroups({
+			tools,
+			configured: { subagent: ["subagent_status"] },
+			alwaysCallable: ["subagent"],
+		}).get("subagent");
+		assert.equal(group?.needsDeclaration, true);
+	});
+
+	it("should classify single tools exposed as codemode as activation-free groups too", () => {
+		const group = resolveCompanionGroups({
+			tools,
+			auto: true,
+			alwaysCallable: ["subagent", "subagent_status"],
+		}).get("subagent_status");
+		assert.equal(group?.key, "auto:pkg/subagent/index.ts");
+		assert.equal(group?.needsDeclaration, false);
 	});
 });

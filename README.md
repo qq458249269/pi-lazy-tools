@@ -340,3 +340,44 @@ npm run typecheck   # tsc --noEmit（严格模式）
 ## License
 
 MIT
+## 必备组件（同插件整组启用）
+
+有些扩展的多个工具共享内部状态（例如 `@arhen/pi-core-subagent` 的 `subagent` / `subagent_status` / `subagent_result` / `await_subagent` / `reply_subagent` / `steer_subagent` / `resume_subagent` / `subagent_cancel` 共用一个 `SubagentManager`）。这时只代理其中一个工具会在重放源码得到的**临时闭包**里建出第二份状态，于是 `subagent_status` 报 `Unknown runId`。
+
+本扩展的处理：**命中任一成员即把整组工具按需启用**（`settings.json` 可配）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `lazyToolCompanions` | `{ [工具名]: string[] }` | 显式声明必备组件。声明互通（`a` 列了 `b` ⇒ `b` 也带出 `a`），传递引用自动并入同一组。 |
+| `lazyToolAutoCompanions` | `boolean` | `true` 时按 `sourceInfo.path` 自动成组（同一扩展包即同组），单组超过 12 个工具不成组。 |
+| `lazyToolCompanionsMode` | `"activate" \| "off"` | `"off"`（或 `lazyToolCompanions: false`）彻底关闭整组启用。 |
+
+示例：
+
+```json
+{
+  "defaultTools": ["read", "edit", "write", "bash"],
+  "lazyToolCompanions": {
+    "subagent": [
+      "subagent_status",
+      "subagent_result",
+      "await_subagent",
+      "reply_subagent",
+      "steer_subagent",
+      "resume_subagent",
+      "subagent_cancel"
+    ]
+  }
+}
+```
+
+行为边界（刻意保守，都是为了前缀与正确性）：
+
+- **不在 session_start 激活任何东西**：组只在 `session_start` 里被算出来，不动 active 集；首个请求的 tools 字段与配置无关。
+- **只追加**：不改写任何已有系统提示词 section；激活告知只追加在工具结果末尾的 content block（`[已随 X 一并启用同族必备工具：…]`），并记在 `details.activatedCompanions`。
+- **每组每会话只 `setActiveTools` 一次**：重复调用不再动 tools 字段，避免反复扰动前缀缓存。
+- **全有或全无**：组内任何成员不在注册表（被 `-t` 裁掉 / 扩展没加载）就整组拒绝，并点名缺哪个——半组可用会以 `Unknown runId` 之类的假故障收场，比整组不可用更糟。
+- **优先走 `ctx.executeTool`**（pi ≥ 0.99）：激活后若工具在 `ctx.tools` 里，就执行注册表里的真实实例（有状态扩展的事件/widget/persist 全部有效），不再重放源码；旧宿主才回落重放。
+- **免声明的组不激活**：若组内工具全是 `exposure: "codemode" | "deferred"`（注册即可调，与 active 集无关），本扩展只走 `ctx.executeTool`，**全程零请求侧变化**。这也是 provider 不支持动态 tools 时最省的做法：把有状态扩展的工具声明成 `codemode`，就永远不需要激活。
+
+代价：一次整组启用 = 一次请求级 tools 变更 = 至多一次前缀失效（此后该组不再变动）。想要真正零变化，请让插件自己声明 `exposure: "codemode"`，本扩展会自动识别并跳过激活。

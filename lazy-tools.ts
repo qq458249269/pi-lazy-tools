@@ -25,8 +25,13 @@ import {
 	buildStartupNotice,
 	rankToolMatches,
 	nonLoadableSourceReason,
+planGroupActivation,
+	resolveCompanionGroups,
+	isAlwaysCallableExposure,
 	PI_BUILTIN_DEFAULT_TOOLS,
+type CompanionGroup,
 	type DefaultToolsCandidate,
+	type ToolSourceLike,
 } from "./lazy-tools/core.ts";
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -65,14 +70,17 @@ const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按
  * 注意：pi 会自行给 section 内容包 `<rules>`/`</rules>` 标签，故此处放裸文本，勿自带标签（否则双嵌套）。
  */
 const RULES_NOTE =
-	"- 文件操作用 bash (ls, rg, find)；读文件用 read。\n" +
+	"-；读文件用 read。\n" +
 	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
 	"- 新文件/整体重写用 write。\n" +
-	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
+"- 可查 PI_* 环境变量取模型与会话信息。\n" +
+	// 上下文增长越快，自动压缩来得越早；压缩必然重写前缀（那一轮命中率归零）。
+	"- 控制输出体积（保 prompt cache）：长输出限量 `| head -80` / `| tail -40`；大文件先 `wc -l`/`rg -c` 再按区间读（read 用 offset/limit）；搜索用 `rg -m 20`、`--max-count`；结论已定就别反复重贴文件/日志原文，只给路径 + 关键行。\n" +
 	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
 
+// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\Agent\pi
 const DOCS_NOTE =
-	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 docs/ 与 examples/（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
+	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 D:\\Agent\\pi\\docs 与 D:\\Agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
 
 /** pi 的 agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`。 */
 function getAgentDir(): string {
@@ -252,8 +260,14 @@ export default function (pi: ExtensionAPI) {
 	// 本扩展主动塞回 active 集的工具（defaultTools: [] 时的内建基线）。启用它们会让
 	// pi 把其 promptSnippet/promptGuidelines 并进系统提示词；before_agent_start 里须
 	// 把这批工具的 prompt 元数据剔除，否则「启用工具」本身就在动缓存前缀。
-	let forcedResidentNames: string[] = [];
+let forcedResidentNames: string[] = [];
 	let skills: SkillMeta[] = [];
+	// 必备组件组（工具名 → 组）：命中任一成员即整组一起进 active 集，避免半组可用
+	// 导致的假故障（如 subagent 起了 run、subagent_result 却读不到）。
+	let companionGroups = new Map<string, CompanionGroup>();
+	// 已整组激活过的组 key：每组每会话只 setActiveTools 一次（每次调用都会往 transcript
+	// 追加一条 tool-change，故必须去重）。
+	let activatedCompanions = new Set<string>();
 	// session 级：schema-first 摘要按工具缓存；成功执行过的工具不再重复展示摘要
 	const summaryCache = new Map<string, string>();
 	const usedTools = new Set<string>();
@@ -263,7 +277,7 @@ export default function (pi: ExtensionAPI) {
   用途：${description}
   参数：${summarizeSchema(schema)}`;
 
-	const renderSkillHits = (goal: string): string => {
+const renderSkillHits = (goal: string): string => {
 		if (goal.trim().length === 0) return "";
 		const hits = matchSkills(goal, skills);
 		if (hits.length === 0) return "";
@@ -271,6 +285,56 @@ export default function (pi: ExtensionAPI) {
 			"\n\n匹配到的技能（skill 非工具：请 read 其 SKILL.md 取用法）：\n" +
 			hits.map((s) => `- ${s.name}: ${s.description}（${s.filePath}）`).join("\n")
 		);
+	};
+
+/**
+	 * ctx.executeTool / ctx.tools 是 pi ≥0.99 的 API，而本包的 devDependency 仍锁在
+	 * 0.87.x（ExtensionContext 上没有这两个成员），故走局部结构类型取用，不全局断言。
+	 */
+type ExecutableCtx = {
+		tools?: readonly string[];
+		executeTool?: (
+			name: string,
+			args: unknown,
+			opts?: { signal?: AbortSignal; onUpdate?: unknown },
+		) => Promise<Awaited<ReturnType<ToolDefinition["execute"]>>>;
+	};
+
+	/** 该工具当前能否走 ctx.executeTool（旧宿主/测试桩返回 false，自动走重放回落）。 */
+	const executableCtx = (ctx: unknown): ExecutableCtx | null => {
+		const c = ctx as ExecutableCtx | undefined;
+		return c && typeof c.executeTool === "function" && Array.isArray(c.tools) ? c : null;
+	};
+
+	/**
+	 * 必备组件整组激活：命中任一成员即把全组一次 setActiveTools 拉进 active 集。
+	 * 三条硬规则：
+	 *   1) 只追加——不重写任何提示词 section，每次调用至多一条 tool-change 记录；
+	 *   2) 每组每会话只激活一次（activatedCompanions 去重），避免反复扰动前缀缓存；
+	 *   3) 全有或全无——组内有成员不在注册表就整组拒绝，宁可不可用也不半可用。
+	 */
+const ensureCompanionsActive = (
+		name: string,
+		omnifiable: ReadonlyArray<{ name: string }>,
+	): { ok: boolean; activated: string[]; reason?: string } => {
+		const group = companionGroups.get(name);
+		if (!group || activatedCompanions.has(group.key)) return { ok: true, activated: [] };
+		if (!group.needsDeclaration) {
+			// 全组都是 codemode/deferred：注册即可调，与 active 集无关 → 不产生任何请求侧变化。
+			activatedCompanions.add(group.key);
+			return { ok: true, activated: [] };
+		}
+		const registered = new Set(omnifiable.map((t) => t.name));
+		const planned = planGroupActivation({
+			group,
+			registered,
+			active: new Set(pi.getActiveTools()),
+		});
+		if (!planned.ok) return { ok: false, activated: [], reason: planned.reason };
+		activatedCompanions.add(group.key);
+		if (planned.plan.toActivate.length === 0) return { ok: true, activated: [] };
+		pi.setActiveTools([...pi.getActiveTools(), ...planned.plan.toActivate]);
+		return { ok: true, activated: planned.plan.toActivate };
 	};
 
 	// 全能入口：四合一。搜索→(schema-first 返参数摘要 | 校验执行)，未及则名录+技能。
@@ -400,22 +464,44 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 
-					const sourcePath = info.sourceInfo?.path;
+const sourcePath = info.sourceInfo?.path;
 					if (!sourcePath) throw new Error("缺少来源路径");
-					const definition = await findToolDefinition(sourcePath, name, pi);
-					if (!definition) throw new Error("执行定义加载失败");
 
-					const result = await definition.execute(
-						toolCallId,
-						params.args as never,
-						signal,
-						onUpdate,
-						ctx,
-					);
+					// 必备组件先行：整组一起进 active 集（全有或全无），并尽量走
+					// ctx.executeTool —— 那是注册表里的真实实例（事件/widget/persist 全活），
+					// 而非下面重放源码得到的临时闭包。有状态扩展靠这一步才不会「起了 run 读不到」。
+					const companions = ensureCompanionsActive(name, omnifiable);
+					if (!companions.ok) {
+						reasons.push(`- ${name}: ${companions.reason}`);
+						break;
+					}
+const execCtx = executableCtx(ctx);
+					const callable = execCtx !== null && execCtx.tools!.includes(name);
+					const definition = callable ? undefined : await findToolDefinition(sourcePath, name, pi);
+					if (!callable && !definition) throw new Error("执行定义加载失败");
+
+					const result = callable
+						? await execCtx!.executeTool!(name, params.args, { signal, onUpdate })
+						: await definition!.execute(toolCallId, params.args as never, signal, onUpdate, ctx);
 					usedTools.add(name);
-					return {
-						content: result.content,
-						details: { ok: true, tool: name, ...(result?.details ?? {}) },
+					// 仅追加：激活告知跟在工具结果之后，不碰任何已有提示词字节。
+					const note =
+						companions.activated.length > 0
+							? {
+									type: "text" as const,
+									text:
+										`\n[已随 ${name} 一并启用同族必备工具：${companions.activated.join(", ")}` +
+										"；下一轮起可直接调用。]",
+								}
+							: null;
+return {
+						content: note ? [...result.content, note] : result.content,
+						details: {
+							ok: true,
+							tool: name,
+							...(companions.activated.length > 0 ? { activatedCompanions: companions.activated } : {}),
+							...(result?.details ?? {}),
+						},
 					};
 				} catch (err) {
 					reasons.push(`- ${name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -498,9 +584,11 @@ export default function (pi: ExtensionAPI) {
 			const allTools = pi.getAllTools();
 			const allToolNames = allTools.map((tool) => tool.name);
 			if (!allToolNames.includes(OMNIFY_NAME)) {
-				lazyNames = [];
+lazyNames = [];
 				lazySet = new Set();
 				forcedResidentNames = [];
+				companionGroups = new Map();
+				activatedCompanions = new Set<string>();
 				const message =
 					`[lazy-tools] ${OMNIFY_NAME} 不在工具注册表（启动参数裁剪了搜索池），` +
 					`本会话不做懒加载。裸 pi.exe 启动即可恢复。`;
@@ -539,8 +627,38 @@ export default function (pi: ExtensionAPI) {
 				...baselineFallback,
 				...nonOmnifiable,
 			]);
-			lazyNames = allToolNames.filter((name) => !resident.has(name));
+lazyNames = allToolNames.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
+
+// 必备组件组：显式声明（lazyToolCompanions）+ 可选的按包自动成组
+			// （lazyToolAutoCompanions）。项目级出现任一字段即整体覆盖用户级，与 defaultTools 同规则。
+			// 这里只算组，不动 active 集：铁律=不得在 session 启动时激活任何工具（会让首个请求变大）。
+			const hasCompanionConfig = (s: Record<string, unknown> | null): s is Record<string, unknown> =>
+				s !== null &&
+				("lazyToolCompanions" in s ||
+					"lazyToolAutoCompanions" in s ||
+					"lazyToolCompanionsMode" in s);
+			const companionSource = hasCompanionConfig(projectSettings)
+				? projectSettings
+				: hasCompanionConfig(userSettings)
+					? userSettings
+					: null;
+			const companionMode = companionSource?.lazyToolCompanionsMode;
+			const companionOff = companionSource?.lazyToolCompanions === false || companionMode === "off";
+			companionGroups = companionOff
+				? new Map<string, CompanionGroup>()
+				: resolveCompanionGroups({
+						tools: allTools.map((t) => ({ name: t.name, sourcePath: t.sourceInfo?.path })),
+						configured: (companionSource?.lazyToolCompanions ?? null) as Record<
+							string,
+							string[]
+						> | null,
+						auto: companionSource?.lazyToolAutoCompanions === true,
+alwaysCallable: allTools
+							.filter((t) => isAlwaysCallableExposure((t as ToolSourceLike).exposure))
+							.map((t) => t.name),
+					});
+			activatedCompanions = new Set<string>();
 			definitionCache.clear();
 			summaryCache.clear();
 			usedTools.clear();

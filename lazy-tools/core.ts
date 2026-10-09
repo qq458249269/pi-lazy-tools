@@ -315,6 +315,147 @@ export function rankToolMatches(goal: string, toolInfos: ToolInfoLike[]): string
 export interface ToolSourceLike {
 	path?: string;
 	source?: string;
+	/** pi ≥0.99 报出的曝光方式（direct / model-only / codemode / deferred / hidden）。 */
+	exposure?: string;
+}
+
+/** 注册即可调、与 active 集无关的曝光（docs/extensions.md「Tool exposure」）。 */
+export function isAlwaysCallableExposure(exposure: string | undefined): boolean {
+	return exposure === "codemode" || exposure === "deferred";
+}
+
+/* ───────────────────────── 必备组件（companion groups） ─────────────────────────
+ * 有状态的多工具扩展，成员之间互为前提：subagent 起了 run，subagent_status /
+ * subagent_result / await_subagent 才能读它；只启用一半就会得到 Unknown runId 这类
+ * 假故障。故命中任一成员即整组一起进 active 集，且必须「全有或全无」。
+ */
+
+/** 一个必备组件组：key 为组标识（显式组名或来源路径），members 为组内工具名。 */
+export interface CompanionGroup {
+	key: string;
+	members: string[];
+	/**
+	 * 是否必须把工具声明给模型才能调用。
+	 * false = 组内全是 codemode/deferred 曝光（注册即可调，与 active 集无关），
+	 *         这类组全程零请求变化、无需激活。
+	 */
+	needsDeclaration: boolean;
+}
+
+/** 自动按来源路径成组时的成员数上限：过大的包（如 MCP 适配器）不自动整包灌入。 */
+export const AUTO_COMPANION_GROUP_MAX = 12;
+
+export interface CompanionGroupInput {
+	/** 注册表里的全部可 omnify 工具（名字 + 来源路径）。 */
+	tools: Array<{ name: string; sourcePath?: string }>;
+	/** settings.json 的 `lazyToolCompanions`：{ 成员: [必备组件...] }。 */
+	configured?: Record<string, string[]> | null;
+/** settings.json 的 `lazyToolAutoCompanions`：true 时按同一扩展包自动成组。 */
+	auto?: boolean;
+	/**
+	 * 注册即可调、不依赖 active 集的工具名（codemode / deferred 曝光）。
+	 * 它们的组不需要激活：只走 ctx.executeTool，不产生任何请求侧变化。
+	 */
+	alwaysCallable?: readonly string[];
+}
+
+/**
+ * 由配置 + 来源路径算出「工具名 → 必备组件组」。
+ * 显式声明是双向并集：subagent 列了 status，status 也因此能带出整组，
+ * 这样模型无论先点名哪一个，激活的都是同一组。
+ */
+export function resolveCompanionGroups(input: CompanionGroupInput): Map<string, CompanionGroup> {
+const names = new Set(input.tools.map((t) => t.name));
+
+	// 1) 显式声明：连通分量即一组（声明互通，含传递引用）。
+	const declared = new Map<string, Set<string>>();
+	for (const [member, companions] of Object.entries(input.configured ?? {})) {
+		if (!Array.isArray(companions)) continue;
+		const list = companions.filter((c) => typeof c === "string" && c.length > 0);
+		if (list.length === 0) continue;
+		declared.set(member, new Set(list));
+	}
+/** name 所在的连通分量（声明互通即同组，含传递引用到的伙伴）。 */
+	const component = (name: string): string[] => {
+		const seen = new Set<string>();
+		const stack = [name];
+		while (stack.length > 0) {
+			const cur = stack.pop()!;
+			if (seen.has(cur)) continue;
+			seen.add(cur);
+			for (const other of declared.get(cur) ?? []) stack.push(other);
+		}
+		return [...seen].sort();
+	};
+const comps = new Map<string, string[]>();
+	for (const [member] of declared) {
+		const comp = component(member);
+		// 分量内最小名为标签（等价类归一），保留最大的那份描述。
+		const label = comp[0];
+		const prev = comps.get(label);
+		if (!prev || comp.length > prev.length) comps.set(label, comp);
+	}
+
+	// 2) 自动成组：同一扩展包（sourceInfo.path）即同一组，过大不成组。
+	const byPath = new Map<string, string[]>();
+	if (input.auto === true) {
+		for (const tool of input.tools) {
+			const path = tool.sourcePath;
+			if (!path) continue;
+			const list = byPath.get(path) ?? [];
+			list.push(tool.name);
+			byPath.set(path, list);
+		}
+	}
+
+	// 3) 组内成员一律限注册表内，且剔除不可 omnify 的名字（它们不经此路径激活）。
+	const alwaysCallable = new Set(input.alwaysCallable ?? []);
+	const out = new Map<string, CompanionGroup>();
+	// 组内顺序固定为字典序：同一组在每个成员处得到完全相同的数组（便于断言与日志对账）。
+for (const comp of comps.values()) {
+		const members = comp.filter((n) => names.has(n)).sort();
+		if (members.length < 2) continue;
+		const group: CompanionGroup = {
+			key: `explicit:${members.join("|")}`,
+			members,
+			needsDeclaration: members.some((m) => !alwaysCallable.has(m)),
+		};
+		for (const member of members) out.set(member, group);
+	}
+	for (const [path, list] of byPath) {
+		const members = list.filter((n) => names.has(n)).sort();
+		if (members.length < 2 || members.length > AUTO_COMPANION_GROUP_MAX) continue;
+		const group: CompanionGroup = {
+			key: `auto:${path}`,
+			members,
+			needsDeclaration: members.some((m) => !alwaysCallable.has(m)),
+		};
+		for (const member of members) out.set(member, group);
+	}
+	return out;
+}
+
+export interface GroupActivationPlan {
+	/** 本次需要追加进 active 集的名字（组内顺序、去重、幂等）。 */
+	toActivate: string[];
+}
+
+/**
+ * 整组激活计划：全有或全无。
+ * 组内任何成员已不在注册表（被 -t 裁掉 / 扩展没加载）即拒绝激活——半组可用比全组
+ * 不可用更糟：调用会以 Unknown runId 之类的假故障收场。
+ */
+export function planGroupActivation(input: {
+	group: CompanionGroup;
+	registered: ReadonlySet<string>;
+	active: ReadonlySet<string>;
+}): { ok: true; plan: GroupActivationPlan } | { ok: false; reason: string } {
+	const missing = input.group.members.filter((m) => !input.registered.has(m));
+	if (missing.length > 0) {
+		return { ok: false, reason: `必备组件未注册（被 -t 裁掉或扩展未加载）：${missing.join(", ")}` };
+	}
+	const toActivate = input.group.members.filter((m) => !input.active.has(m));
+	return { ok: true, plan: { toActivate } };
 }
 
 /**
