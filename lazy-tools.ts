@@ -89,9 +89,9 @@ const RULES_NOTE =
 	"- bash：路径只用正斜杠（/d/resp/...），`cd /d/xxx` 单参数，禁用 cmd 惯用法 `cd /d <path>`；查文件优先 fd、禁用 find；复杂正则用 grep -oE（不用 BRE 区间）；搜索限范围限量（rg -m 20 -l），长输出 `| head -80`，大文件用 read 的 offset/limit 切片。\n" +
 	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
 
-// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\agent\pi
+// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\Agent\pi
 const DOCS_NOTE =
-	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\agent\\pi\\README.md；副档 D:\\agent\\pi\\docs 与 D:\\agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
+	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 D:\\Agent\\pi\\docs 与 D:\\Agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
 
 /** pi 的 agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`。 */
 function getAgentDir(): string {
