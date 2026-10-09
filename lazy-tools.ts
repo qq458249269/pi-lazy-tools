@@ -75,8 +75,9 @@ const RULES_NOTE =
 	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
 	"- 新文件/整体重写用 write。\n" +
 	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
-	// 上下文增长越快，自动压缩来得越早；压缩必然重写前缀（那一轮命中率归零）。
-	"- 控制输出体积（保 prompt cache）：长输出限量 `| head -80` / `| tail -40`；大文件先 `wc -l`/`rg -c` 再按区间读（read 用 offset/limit）；搜索用 `rg -m 20`、`--max-count`；结论已定就别反复重贴文件/日志原文，只给路径 + 关键行。\n" +
+// 下面这条每轮都在前缀里，故写清「不报错」的用法：cmd 的 `cd /d <path>` 在 bash 里
+	// 会报 too many arguments（cd 只收一个参数），反斜杠路径会被转义拆坏，整仓 grep 撞 30s 超时。
+	"- bash：路径只用正斜杠（/d/resp/...），`cd /d/xxx` 单参数，禁用 cmd 惯用法 `cd /d <path>`；查文件优先 fd、禁用 find；复杂正则用 grep -oE（不用 BRE 区间）；搜索限范围限量（rg -m 20 -l），长输出 `| head -80`，大文件用 read 的 offset/limit 切片。\n" +
 	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
 
 // [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\agent\pi
