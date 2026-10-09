@@ -272,11 +272,21 @@ function ngramSet(text: string, n: number): string[] {
 /**
  * Rank candidate tools by relevance to a natural-language goal.
  *
- * Scoring (higher wins):
- * - goal equals tool name: 10
+* Scoring (higher wins):
+* - goal equals tool name: 10
  * - goal or tool name contains the other: 6
  * - goal appears in description verbatim: 5
- * - each >=2-char space-separated word of goal found in description: +1
+ * - each goal word appearing in the tool NAME: +3
+ * - each goal word (or CN synonym) found in the name/description: +1
+ *
+ * 入候选门槛：score>0 且（中文 2-gram 命中 ≥1 或 拉丁词元命中 ≥2 或 score≥5）。
+ * 单个拉丁词的顺带命中（任何提到 find 的 md_* 描述）不算相关。
+ *
+* 2-gram 只走中文：拉丁 2-gram（il/le/nd/in…）对任何英文 goal 都是噪声，会把
+ * md_edit/md_diff/md_inspect 同时点亮并挤掉真正对口的 fd。
+ *
+ * 工具描述皆英文，中文 goal 靠 CN→EN 同义词桥（CN_SYNONYMS）才能命中；无桥时
+ * 中文 goal 几乎必然零命中，只能回落名录。
  *
  * Returns names with score > 0, best first. Empty goal yields no matches.
  * Chinese goals rarely embed as substrings, so prefer the explicit `tool`
@@ -286,27 +296,70 @@ export function rankToolMatches(goal: string, toolInfos: ToolInfoLike[]): string
 	const g = goal.trim().toLowerCase();
 	if (!g) return [];
 
-	// 中英文词元：整词（≥2 字符）或 2-gram 窗口。
-	const tokens = new Set<string>();
+	// 英文虚词：对工具描述而言全是噪声（"find files by name" 里的 by/name 会点亮
+	// 每个描述含 by 的工具）。中文语义靠 CJK 2-gram 承担。
+	const EN_STOPWORDS = new Set([
+		"by", "of", "to", "in", "on", "at", "is", "it", "an", "and", "or", "for", "with",
+		"from", "that", "this", "name", "names", "use", "using", "want", "need", "please",
+	]);
+	// 中文→英文概念桥：描述全是英文，无桥则中文 goal 零命中。刻意只收「描述里真会出现
+	// 的词」，不求覆盖率——同义词越泛，噪声越大。
+	const CN_SYNONYMS: readonly (readonly [RegExp, readonly string[]])[] = [
+		[/查找|搜索|搜一?下|找找|找/, ["find", "search"]],
+		[/文件/, ["file", "files"]],
+		[/目录|文件夹/, ["directory", "dir", "path"]],
+		[/内容|文本|字符串|代码里/, ["content", "text", "string"]],
+		[/最近|改动过|改过|变更|新加/, ["changed", "recent", "new"]],
+		[/截图|截屏/, ["screenshot"]],
+		[/浏览器|网页/, ["browser", "page"]],
+		[/重命名/, ["rename"]],
+		[/对比|比较|差异|不同/, ["diff", "compare"]],
+		[/段落|章节|小节/, ["section", "block"]],
+		[/安装|装上/, ["install", "setup"]],
+		[/终端|命令行/, ["shell", "command", "terminal"]],
+	];
+	/** 拉丁词元：goal 里真实写下的英文（或经同义词桥补出的英文）。 */
+	const ascii = new Set<string>();
+	/** 中文 2-gram：中文语义的主载体。 */
+	const cjk = new Set<string>();
 	for (const w of g.split(/\W+/)) {
-		if (w.length >= 2) tokens.add(w);
+		if (w.length >= 2 && !EN_STOPWORDS.has(w)) ascii.add(w);
 	}
-	for (const g2 of ngramSet(g, 2)) tokens.add(g2);
+	for (const g2 of ngramSet(g, 2)) {
+		// 2-gram 只为中文而生：英文已由整词覆盖，而拉丁 2-gram（il/le/nd/in…）纯属噪声，
+		// 会让「文件」类 goal 同时点亮 md_edit/md_diff/md_inspect 三家。
+		if (/[^\x00-\x7F]/.test(g2)) cjk.add(g2);
+	}
+	for (const [re, words] of CN_SYNONYMS) {
+		if (re.test(g)) for (const w of words) ascii.add(w);
+	}
 
 	const scored = toolInfos
 		.map((t) => {
 			const name = t.name.toLowerCase();
 			const desc = t.description.toLowerCase();
+			const countHits = (words: ReadonlySet<string>): number => {
+				let n = 0;
+				for (const w of words) if (name.includes(w) || desc.includes(w)) n += 1;
+				return n;
+			};
 			let score = 0;
 			if (name === g) score += 10;
 			else if (name.includes(g) || g.includes(name)) score += 6;
-			if (desc.includes(g)) score += 5;
-			for (const w of tokens) {
-				if (desc.includes(w)) score += 1;
+// 整句/整词在描述中原样出现才算强证据；短 goal（ls/ts/go）不然会藏在
+			// 任意长词里（ca**ls**、impor**ts**）白拿 +5。
+			if (g.length >= 4 && desc.includes(g)) score += 5;
+			// 名字命中权重高于描述：描述里出现一个词常是顺带（长描述几乎必含），
+			// 名字命中才说明「说的就是它」。
+			for (const w of new Set([...ascii, ...cjk])) {
+				if (name.includes(w)) score += 3;
 			}
-			return { name: t.name, score };
+			score += countHits(ascii) + countHits(cjk);
+			return { name: t.name, score, asciiHits: countHits(ascii), cjkHits: countHits(cjk) };
 		})
-		.filter((s) => s.score > 0)
+		// 门槛：单个拉丁词命中不算相关（"find" 会顺带点亮每个提到 find 的 md_* 描述）；
+		// 中文 2-gram 命中一次即算（「找文件」之于 fd）。名字/整句命中已叠在上方 score 里。
+		.filter((s) => s.score > 0 && (s.asciiHits >= 2 || s.cjkHits > 0 || s.score >= 5))
 		.sort((a, b) => b.score - a.score);
 	return scored.map((s) => s.name);
 }
@@ -462,7 +515,7 @@ export function planGroupActivation(input: {
  * 判断某个候选工具的定义能否用「重新 import 源文件」的方式取到；不能时给出可直接
  * 转达给模型的中文原因（null = 可以加载）。
  *
- * pi 内建工具（read/bash/edit/write/ls/powershell/grep/find）不是扩展模块：它们由 pi
+* pi 内建工具（read/bash/edit/write/ls/powershell/grep）不是扩展模块：它们由 pi
  * 自己的工厂函数（createLsTool(cwd, options) 之类）造出来，sourceInfo 是**合成标记**
  * ——path 形如 `<sdk:ls>` / `<builtin:ls>`，source 为 `sdk` / `builtin`。对这种路径做
  * jiti.import 必然抛错，旧实现只报一句「执行定义加载失败」，模型看不出该换手段。

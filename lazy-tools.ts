@@ -44,7 +44,7 @@ const OMNIFY_NAME = "omnify";
 
 /** 内建工具执行不了时的统一提示（挂在失败文案尾部）。 */
 const BUILTIN_ONLY_HINT =
-	"\n提示：omnify 只能执行扩展注册的工具；内建工具（read/bash/edit/write/ls/powershell/grep/find）"
+	"\n提示：omnify 只能执行扩展注册的工具；内建工具（read/bash/edit/write/ls/powershell/grep）"
 	+ "请直接用常驻工具调用。";
 
 
@@ -70,17 +70,18 @@ const SKILLS_NOTE = "技能清单不列于此。需用时以 omnify 检索，按
  * 注意：pi 会自行给 section 内容包 `<rules>`/`</rules>` 标签，故此处放裸文本，勿自带标签（否则双嵌套）。
  */
 const RULES_NOTE =
-	"-；读文件用 read。\n" +
+	"- 文件操作用 bash (ls, rg, fd)；读文件用 read。\n" +
+	"- 查文件/目录一律优先 fd（omnify 检索或直接调 fd 工具）；禁用 find（会假死，已被 no-find 拦）。\n" +
 	"- 精改用 edit：edits[].oldText 与原文精确匹配且唯一；同文件多处修改合并为一次调用；text 重复处加 anchor 定位；改名用 replaceAll:true。\n" +
 	"- 新文件/整体重写用 write。\n" +
-"- 可查 PI_* 环境变量取模型与会话信息。\n" +
+	"- 可查 PI_* 环境变量取模型与会话信息。\n" +
 	// 上下文增长越快，自动压缩来得越早；压缩必然重写前缀（那一轮命中率归零）。
 	"- 控制输出体积（保 prompt cache）：长输出限量 `| head -80` / `| tail -40`；大文件先 `wc -l`/`rg -c` 再按区间读（read 用 offset/limit）；搜索用 `rg -m 20`、`--max-count`；结论已定就别反复重贴文件/日志原文，只给路径 + 关键行。\n" +
 	"- 响应精简；路径/命令/报错原文保留。安全警告、不可逆操作、多步有序流程用完整清晰语气。按用户语言作答。";
 
-// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\Agent\pi
+// [fix-lazy-tools-notes] 路径由 pi 安装目录实测填入（where pi.exe / node_modules）：D:\agent\pi
 const DOCS_NOTE =
-	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\Agent\\pi\\README.md；副档 D:\\Agent\\pi\\docs 与 D:\\Agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
+	"PI 文档（仅当用户问及 pi 自身/SDK/扩展/主题/技能/TUI 时读取）：D:\\agent\\pi\\README.md；副档 D:\\agent\\pi\\docs 与 D:\\agent\\pi\\examples（按 README 索引解析相对路径）。读 pi 相关 md 须全文读完并循内部链接。";
 
 /** pi 的 agent 目录：`PI_CODING_AGENT_DIR` 优先，否则 `~/.pi/agent`。 */
 function getAgentDir(): string {
@@ -346,7 +347,7 @@ const ensureCompanionsActive = (
 		promptGuidelines: [
 			"无 args：返候选参数要求，补 args 重试。",
 			"失败：按明细补参/指名重试，或退常规手段。",
-			"内建工具（read/bash/edit/write/ls/powershell/grep/find）不经 omnify，直接调用。",
+"内建工具（read/bash/edit/write/ls/powershell/grep）不经 omnify，直接调用。",
 		],
 		parameters: OmnifyParams,
 

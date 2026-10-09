@@ -259,7 +259,7 @@ pi-lazy-extensions 按扩展粒度懒加载：jiti 动态 import 整个扩展模
 
 按 pi 0.87.x 的实现（`dist/core/sdk.js` → `allowedToolNames = options.tools ?? (noTools === "all" ? [] : undefined)`，注册表按 `isAllowedTool()` 过滤），`--tools` 不是无条件白名单：
 
-- **不传任何工具参数**（裸 `pi.exe`）→ `allowedToolNames` 为 undefined，注册表不过滤。`getAllTools()` 返回全部内置工具（含默认不 active 的 grep/find/ls/powershell）与全部扩展工具。扩展工具 omnify 能搜到、能执行；内建工具只用于判定「必须常驻」，绝不进搜索池（见坑 7）。裸启动反而是最省事的情形。
+（含默认不 active 的 grep/find/ls/powershell；本机 `find` 已被 no-find 禁用，文件搜索走 fd）
 - **`-t/--tools a,b`** → `allowedToolNames` 变成白名单，注册表只剩列出的名字，其余 omnify 搜不到。
 - **`-nt/--no-tools`** → `allowedToolNames=[]`，注册表清空，只剩 omnify 自己。
 - **`-xt/--exclude-tools X`** → X 从注册表剔除，omnify 搜不到。
