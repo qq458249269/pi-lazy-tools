@@ -1219,10 +1219,11 @@ describe("omnify registration copy", () => {
 	});
 });
 /**
- * 必备组件（整组启用）用例。铁律：不在 session 启动时激活；只按需激活；
- * 一次激活就是同一插件的一整组工具，绝不半组。
+ * 同族组件（companion groups）用例。铁律：**会话内不写前缀**——
+ * 除 session_start 外不得调 setActiveTools，故同族工具一律留在 lazy 侧，
+ * 只由 omnify 指名路由（结果尾部追加提示）+ 执行走注册实例。
  */
-describe("omnify 必备组件整组启用", () => {
+describe("omnify 同族路由（不写前缀）", () => {
 	const SUBAGENT_PATH = "pkg/pi-core-subagent/index.ts";
 	const extraTools = [
 		{ name: "subagent_status", sourcePath: SUBAGENT_PATH },
@@ -1242,60 +1243,69 @@ describe("omnify 必备组件整组启用", () => {
 		}, { extraTools, projectCompanions: companions });
 	});
 
-	it("should activate the whole group on first use and report it in the result tail", async () => {
+	it("should route the family through omnify instead of activating it, and never write the prefix", async () => {
 		await withHarness([], async (h) => {
 			const before = h.getSetActiveToolsCalls();
-			const result = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } })) as {
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx(),
+			)) as {
 				content: Array<{ type: string; text: string }>;
-				details: { activatedCompanions?: string[] };
+				details: { companionPeers?: string[] };
 			};
-			const active = h.getActiveTools();
-			for (const name of [FAKE_TOOL_NAME, "subagent_status", "subagent_result"]) {
-				assert.ok(active.includes(name), `命中任一成员即整组激活；缺 ${name}；got: ${JSON.stringify(active)}`);
+			assert.equal(
+				h.getSetActiveToolsCalls(),
+				before,
+				"同族命中后不得调 setActiveTools（tools 字段即请求前缀）",
+			);
+			for (const name of ["subagent_status", "subagent_result"]) {
+				assert.ok(
+					!h.getActiveTools().includes(name),
+					`${name} 应留在 lazy 侧；got: ${JSON.stringify(h.getActiveTools())}`,
+				);
 			}
-			assert.equal(h.getSetActiveToolsCalls() - before, 1, "整组只应触发一次 setActiveTools");
-assert.deepEqual(
-				result.details.activatedCompanions,
-				[FAKE_TOOL_NAME, "subagent_result", "subagent_status"],
-				"details 应记下本次新进 active 集的全组成员",
+			assert.deepEqual(
+				result.details.companionPeers,
+				["subagent_result", "subagent_status"],
+				"details 应记下同族成员（供模型指名调用）",
 			);
 			const text = result.content.map((c) => c.text).join("\n");
-			assert.match(text, /已随 .* 一并启用同族必备工具/, "激活告知应追加在工具结果尾部");
+			assert.match(text, /共享内部状态（同族）/, "路由告知应追加在工具结果尾部");
+			assert.match(text, /omnify\(\{ tool:/, "路由告知应给出指名调用写法");
 		}, { extraTools, projectCompanions: companions });
 	});
 
-	it("should stay idempotent across repeated calls in the same session", async () => {
+	it("should append the routing notice only once per family per session", async () => {
 		await withHarness([], async (h) => {
-			await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } });
-			const after = h.getSetActiveToolsCalls();
-			const result = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "submit" } })) as {
-				details: { activatedCompanions?: string[] };
-			};
-			assert.equal(h.getSetActiveToolsCalls(), after, "重复调用不得再动 active 集（前缀缓存）");
-			assert.equal(result.details.activatedCompanions, undefined, "第二次不应再报激活");
+			await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } }, h.makeExecutableCtx());
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "submit" } },
+				h.makeExecutableCtx(),
+			)) as { content: Array<{ type: string; text: string }> };
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.doesNotMatch(text, /共享内部状态/, "同族提示每组只追加一次，避免刷屏");
 		}, { extraTools, projectCompanions: companions });
 	});
 
-	it("should refuse the whole group when a member is missing from the registry", async () => {
+	it("should refuse the whole family when a member is missing from the registry", async () => {
 		await withHarness([], async (h) => {
 			h.hideToolFromRegistry("subagent_result");
 			const result = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } })) as {
 				content: Array<{ type: string; text: string }>;
 			};
 			const text = result.content.map((c) => c.text).join("\n");
-			assert.match(text, /必备组件未注册/, "缺成员应明确拒绝，而不是半组可用");
+			assert.match(text, /同族未装齐/, "缺成员应明确拒绝，而不是半组可用");
 			assert.match(text, /subagent_result/, "应点名缺失的成员");
-			assert.ok(!h.getActiveTools().includes("subagent_status"), "拒绝时不得留下半组 active");
 			assert.equal(globalCounter(EXECUTE_CALLS_KEY), 0, "拒绝时不得执行目标工具");
 		}, { extraTools, projectCompanions: companions });
 	});
 
-	it("should execute through ctx.executeTool after activation instead of replaying the source", async () => {
+	it("should execute through the registered instance (ctx.executeTool) rather than replaying source", async () => {
 		await withHarness([], async (h) => {
-			const ctx = h.makeExecutableCtx();
-			const result = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } }, ctx)) as {
-				content: Array<{ type: string; text: string }>;
-			};
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx(),
+			)) as { content: Array<{ type: string; text: string }> };
 			assert.deepEqual(h.executeToolCalls(), [FAKE_TOOL_NAME], "应走注册表里的真实实例");
 			assert.equal(globalCounter(FACTORY_CALLS_KEY), 0, "不得重放源码工厂（有状态扩展会丢状态）");
 			const text = result.content.map((c) => c.text).join("\n");
@@ -1303,40 +1313,58 @@ assert.deepEqual(
 		}, { extraTools, projectCompanions: companions });
 	});
 
-it("should group by source path when auto mode is on", async () => {
+	it("should refuse to replay source for a stateful family when no registered instance is callable", async () => {
+		await withHarness([], async (h) => {
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx([]),
+			)) as { content: Array<{ type: string; text: string }> };
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.match(text, /属有状态同族/, "拿不到注册实例时应明确失败，而非造第二份状态");
+			assert.match(text, /codemode/, "失败文案应给出零前缀成本的出路");
+			assert.equal(globalCounter(FACTORY_CALLS_KEY), 0, "绝不重放源码");
+			assert.deepEqual(h.executeToolCalls(), [], "未进 ctx.tools 不得硬调");
+		}, { extraTools, projectCompanions: companions });
+	});
+
+	it("should route by source path when auto mode is on (still without activation)", async () => {
 		const samePackage = [
 			{ name: "subagent_status", sourcePath: FIXTURE_SOURCE },
 			{ name: "subagent_result", sourcePath: FIXTURE_SOURCE },
 		];
 		await withHarness([], async (h) => {
-			await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } });
-			assert.ok(
-				!h.getActiveTools().includes("subagent_status"),
-				"未开自动成组时不得按 sourcePath 激活",
-			);
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx(),
+			)) as { content: Array<{ type: string; text: string }> };
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.doesNotMatch(text, /共享内部状态/, "未开自动成组时不得按 sourcePath 成组");
+			assert.ok(!h.getActiveTools().includes("subagent_status"), "未开自动成组时不得激活");
 		}, { extraTools: samePackage });
 
 		await withHarness([], async (h) => {
-			// 自动成组：fixture 工具与两个 subagent_* 同源 → 一组激活。
-			const result = (await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } })) as {
-				details: { activatedCompanions?: string[] };
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx(),
+			)) as {
+				content: Array<{ type: string; text: string }>;
+				details: { companionPeers?: string[] };
 			};
-assert.deepEqual(result.details.activatedCompanions, [
-				FAKE_TOOL_NAME,
-				"subagent_result",
-				"subagent_status",
-			]);
-			assert.ok(h.getActiveTools().includes("subagent_status"));
+			assert.deepEqual(result.details.companionPeers, ["subagent_result", "subagent_status"]);
+			assert.ok(!h.getActiveTools().includes("subagent_status"), "自动成组也不激活（铁律）");
 		}, { extraTools: samePackage, projectAutoCompanions: true });
 	});
 
-	it("should never activate anything when companion mode is off", async () => {
+	it("should do nothing family-wise when companion mode is off", async () => {
 		await withHarness([], async (h) => {
-			await h.omnify({ goal: FAKE_TOOL_NAME, args: { action: "discover" } });
-			assert.ok(
-				!h.getActiveTools().includes("subagent_status"),
-				"关掉必备组件后不得激活",
-			);
+			const result = (await h.omnify(
+				{ goal: FAKE_TOOL_NAME, args: { action: "discover" } },
+				h.makeExecutableCtx([]),
+			)) as { content: Array<{ type: string; text: string }> };
+			const text = result.content.map((c) => c.text).join("\n");
+			assert.doesNotMatch(text, /共享内部状态/, "关掉同族后不得追加路由提示");
+			assert.doesNotMatch(text, /属有状态同族/, "关掉同族后按无状态工具处理（可重放源码）");
+			assert.ok(!h.getActiveTools().includes("subagent_status"), "关掉同族后不得激活");
 		}, { extraTools, companionsOff: true });
 	});
 });

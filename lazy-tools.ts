@@ -11,6 +11,15 @@
  *   Project: <cwd>/.pi/settings.json（需项目受信任才生效，与 pi 自身规则一致）
  * 两处都没有该字段时，取 pi 内置默认（read, bash, edit, write）；
  * 显式写 `"defaultTools": []` 即全部 lazy。
+ *
+ * ── 铁律：会话内不写前缀 ───────────────────────────────────────────────
+ * tools 字段与系统提示词都是**请求前缀**的一部分。第一条请求发出之后二者都不再变：
+ *   · 除 session_start 外，任何路径都不得调用 pi.setActiveTools
+ *     （曾有的「同族整组激活」正因违反此条被取消，见 companionRouting 的注释）；
+ *   · 同理不得改写任何已有 systemPrompt section，提示一律只追加在消息流末尾。
+ * 代价：会话中途绝无重新命中缓存的机会。收益：整会话零缓存失效、任意模型/供应商通用。
+ * 想让某组工具直接可见，只能写进 settings.json 的 defaultTools 并重开会话——
+ * 那是在会话开始时一次性定下，不产生中途失效。
  */
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -25,7 +34,7 @@ import {
 	buildStartupNotice,
 	rankToolMatches,
 nonLoadableSourceReason,
-	planGroupActivation,
+	planCompanionRouting,
 	resolveCompanionGroups,
 	isAlwaysCallableExposure,
 PI_BUILTIN_DEFAULT_TOOLS,
@@ -264,12 +273,14 @@ export default function (pi: ExtensionAPI) {
 	// 把这批工具的 prompt 元数据剔除，否则「启用工具」本身就在动缓存前缀。
 let forcedResidentNames: string[] = [];
 	let skills: SkillMeta[] = [];
-	// 必备组件组（工具名 → 组）：命中任一成员即整组一起进 active 集，避免半组可用
-	// 导致的假故障（如 subagent 起了 run、subagent_result 却读不到）。
+	// 同族组件组（工具名 → 组）：有状态扩展的成员共享内部状态（subagent 起了 run，
+	// subagent_status 才能读它），逐个代理会各自重放出第二份状态。组信息只用于两件事：
+	//   1) 执行策略：优先走注册实例（ctx.executeTool），有状态家族绝不重放源码；
+	//   2) 路由提示：结果尾部追加一句「同族须 omnify 指名调用」（消息流末尾，不碰前缀）。
+	// 注意：**不做整组激活**——setActiveTools 会改 tools 字段，即改请求前缀（铁律）。
 	let companionGroups = new Map<string, CompanionGroup>();
-	// 已整组激活过的组 key：每组每会话只 setActiveTools 一次（每次调用都会往 transcript
-	// 追加一条 tool-change，故必须去重）。
-	let activatedCompanions = new Set<string>();
+	// 已追加过路由提示的组 key：每组每会话只提示一次（transcript 噪音最小）。
+	let notifiedCompanions = new Set<string>();
 	// session 级：schema-first 摘要按工具缓存；成功执行过的工具不再重复展示摘要
 	const summaryCache = new Map<string, string>();
 	const usedTools = new Set<string>();
@@ -309,34 +320,36 @@ type ExecutableCtx = {
 	};
 
 	/**
-	 * 必备组件整组激活：命中任一成员即把全组一次 setActiveTools 拉进 active 集。
-	 * 三条硬规则：
-	 *   1) 只追加——不重写任何提示词 section，每次调用至多一条 tool-change 记录；
-	 *   2) 每组每会话只激活一次（activatedCompanions 去重），避免反复扰动前缀缓存；
-	 *   3) 全有或全无——组内有成员不在注册表就整组拒绝，宁可不可用也不半可用。
+	 * 同族路由：纯只读，**绝不碰 active 集**（铁律：不写前缀）。
+	 * 返回「除自己外的同族成员」供结果尾部追加指名调用提示；组内成员不全在注册表时整族
+	 * 拒绝（代理半个家族只会得到 Unknown runId 之类的假故障，比整族不可用更糟）。
+	 * `firstNotice` = 本组在本会话还没提示过（提示每组只追加一次，避免刷屏）。
 	 */
-const ensureCompanionsActive = (
+	const companionRouting = (
 		name: string,
 		omnifiable: ReadonlyArray<{ name: string }>,
-	): { ok: boolean; activated: string[]; reason?: string } => {
+	): {
+		ok: boolean;
+		peers: string[];
+		/** 有状态同族（组内存在需要 active 集才可见的工具）→ 禁止重放源码。 */
+		stateful: boolean;
+		firstNotice: boolean;
+		reason?: string;
+	} => {
 		const group = companionGroups.get(name);
-		if (!group || activatedCompanions.has(group.key)) return { ok: true, activated: [] };
-		if (!group.needsDeclaration) {
-			// 全组都是 codemode/deferred：注册即可调，与 active 集无关 → 不产生任何请求侧变化。
-			activatedCompanions.add(group.key);
-			return { ok: true, activated: [] };
-		}
-		const registered = new Set(omnifiable.map((t) => t.name));
-		const planned = planGroupActivation({
+		// 无组，或全组 codemode/deferred（注册即可调）：零请求侧变化，无需任何处理。
+		if (!group || !group.needsDeclaration) return { ok: true, peers: [], stateful: false, firstNotice: false };
+		const planned = planCompanionRouting({
 			group,
-			registered,
-			active: new Set(pi.getActiveTools()),
+			registered: new Set(omnifiable.map((t) => t.name)),
+			self: name,
 		});
-		if (!planned.ok) return { ok: false, activated: [], reason: planned.reason };
-		activatedCompanions.add(group.key);
-		if (planned.plan.toActivate.length === 0) return { ok: true, activated: [] };
-		pi.setActiveTools([...pi.getActiveTools(), ...planned.plan.toActivate]);
-		return { ok: true, activated: planned.plan.toActivate };
+		if (!planned.ok) {
+			return { ok: false, peers: [], stateful: true, firstNotice: false, reason: planned.reason };
+		}
+		const firstNotice = !notifiedCompanions.has(group.key);
+		notifiedCompanions.add(group.key);
+		return { ok: true, peers: planned.plan.peers, stateful: true, firstNotice };
 	};
 
 	// 全能入口：四合一。搜索→(schema-first 返参数摘要 | 校验执行)，未及则名录+技能。
@@ -347,6 +360,8 @@ const ensureCompanionsActive = (
 		promptSnippet: "想完成某事而不知用何工具/技能时，先试 omnify。",
 		promptGuidelines: [
 			"无 args：返候选参数要求，补 args 重试。",
+			"已知参数后一律 tool + args 一次到位（别再裸 goal 空搜一遍）。",
+			"同族工具（共享内部状态、不在工具列表里）同样用 tool + args 指名调用。",
 			"失败：按明细补参/指名重试，或退常规手段。",
 "内建工具（read/bash/edit/write/ls/powershell/grep）不经 omnify，直接调用。",
 		],
@@ -469,16 +484,26 @@ const ensureCompanionsActive = (
 const sourcePath = info.sourceInfo?.path;
 					if (!sourcePath) throw new Error("缺少来源路径");
 
-					// 必备组件先行：整组一起进 active 集（全有或全无），并尽量走
-					// ctx.executeTool —— 那是注册表里的真实实例（事件/widget/persist 全活），
-					// 而非下面重放源码得到的临时闭包。有状态扩展靠这一步才不会「起了 run 读不到」。
-					const companions = ensureCompanionsActive(name, omnifiable);
-					if (!companions.ok) {
-						reasons.push(`- ${name}: ${companions.reason}`);
+					// 同族先行：算出路由（同族成员）+ 执行策略。
+					// 不激活任何东西（铁律：会话内不写前缀）；有状态同族只允许走注册实例，
+					// 因为重放源码得到的临时闭包会建出第二份状态（subagent_status → Unknown runId）。
+					const routing = companionRouting(name, omnifiable);
+					if (!routing.ok) {
+						reasons.push(`- ${name}: ${routing.reason}`);
 						break;
 					}
 const execCtx = executableCtx(ctx);
 					const callable = execCtx !== null && execCtx.tools!.includes(name);
+					if (!callable && routing.stateful) {
+						// 有状态同族且拿不到注册实例（宿主不提供直调、或该工具不在 ctx.tools）：
+						// 宁可明确失败，也不重放源码造第二份状态。
+						throw new Error(
+							`${name} 属有状态同族（${routing.peers.join(", ") || name}），` +
+								"当前宿主无法直调注册实例，重放源码会丢掉运行状态，故不代理它。" +
+								'请让该扩展把工具声明为 exposure: "codemode"（注册即可调，零前缀变化），' +
+								"或把整族加入 settings.json 的 defaultTools 后重开会话。",
+						);
+					}
 					const definition = callable ? undefined : await findToolDefinition(sourcePath, name, pi);
 					if (!callable && !definition) throw new Error("执行定义加载失败");
 
@@ -486,14 +511,15 @@ const execCtx = executableCtx(ctx);
 						? await execCtx!.executeTool!(name, params.args, { signal, onUpdate })
 						: await definition!.execute(toolCallId, params.args as never, signal, onUpdate, ctx);
 					usedTools.add(name);
-					// 仅追加：激活告知跟在工具结果之后，不碰任何已有提示词字节。
+					// 仅追加：路由告知跟在工具结果之后（消息流末尾），不碰任何已有提示词字节。
 					const note =
-						companions.activated.length > 0
+						routing.firstNotice && routing.peers.length > 0
 							? {
 									type: "text" as const,
 									text:
-										`\n[已随 ${name} 一并启用同族必备工具：${companions.activated.join(", ")}` +
-										"；下一轮起可直接调用。]",
+										`\n[${name} 与 ${routing.peers.join(", ")} 共享内部状态（同族）；` +
+										"它们不在工具列表里（不写前缀），后续请用 " +
+										'omnify({ tool: "工具名", args: {...} }) 指名调用。]',
 								}
 							: null;
 return {
@@ -501,7 +527,7 @@ return {
 						details: {
 							ok: true,
 							tool: name,
-							...(companions.activated.length > 0 ? { activatedCompanions: companions.activated } : {}),
+							...(routing.peers.length > 0 ? { companionPeers: routing.peers } : {}),
 							...(result?.details ?? {}),
 						},
 					};
@@ -590,7 +616,7 @@ lazyNames = [];
 				lazySet = new Set();
 				forcedResidentNames = [];
 				companionGroups = new Map();
-				activatedCompanions = new Set<string>();
+				notifiedCompanions = new Set<string>();
 				const message =
 					`[lazy-tools] ${OMNIFY_NAME} 不在工具注册表（启动参数裁剪了搜索池），` +
 					`本会话不做懒加载。裸 pi.exe 启动即可恢复。`;
@@ -632,9 +658,9 @@ lazyNames = [];
 lazyNames = allToolNames.filter((name) => !resident.has(name));
 			lazySet = new Set(lazyNames);
 
-// 必备组件组：显式声明（lazyToolCompanions）+ 可选的按包自动成组
+			// 同族组件组：显式声明（lazyToolCompanions）+ 可选的按包自动成组
 			// （lazyToolAutoCompanions）。项目级出现任一字段即整体覆盖用户级，与 defaultTools 同规则。
-			// 这里只算组，不动 active 集：铁律=不得在 session 启动时激活任何工具（会让首个请求变大）。
+			// 这里只算组，不动 active 集（铁律：会话内不写前缀，启动时也不例外）。
 			const hasCompanionConfig = (s: Record<string, unknown> | null): s is Record<string, unknown> =>
 				s !== null &&
 				("lazyToolCompanions" in s ||
@@ -660,7 +686,7 @@ alwaysCallable: allTools
 							.filter((t) => isAlwaysCallableExposure((t as ToolSourceLike).exposure))
 							.map((t) => t.name),
 					});
-			activatedCompanions = new Set<string>();
+			notifiedCompanions = new Set<string>();
 			definitionCache.clear();
 			summaryCache.clear();
 			usedTools.clear();

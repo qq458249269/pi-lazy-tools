@@ -4,7 +4,7 @@ pi-lazy-tools：让低频工具像 Skill 一样按需加载的 pi 扩展。
 
 主 Agent 能调用哪些工具、每个工具几千字节的说明书，很大程度上决定了它能做什么。这些说明书每一轮请求都完整出现在上下文里，包括那些 95% 场合根本用不上的工具：主 Agent 不得不一遍遍重新扫过它们，注意力持续被稀释。我们此前做的 [async-subagent-isolation](https://github.com/Wolido/async-subagent-isolation) 在 subagent 维度落实了这条「上下文纯净」哲学：主智能体只负责派活、不碰任务细节；工具维度还剩一类问题：低频工具的定义每轮都在场。
 
-Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（启动参数与 pi 运行时元数据都不动），会话开始时把非常驻工具（缺省 = `settings.json` 的 `defaultTools` 名单之外的工具）从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由唯常驻入口 `omnify` 一步完成搜索、取用法与代理执行（四合一：原 load_tools / call_tool / skill_search 并入），执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。常驻名单与 pi 共用同一个 `defaultTools` 字段，不另建配置文件。因 tools 字段与系统提示词在会话内再也不变，懒加载不造成任何缓存失效，任意模型通用（论证见[工作原理](#工作原理)）。
+Skills 对同类问题的解法是渐进式披露（progressive disclosure）：需要时才加载。pi-lazy-tools 把同一思路套到工具上：注册照常（启动参数与 pi 运行时元数据都不动），会话开始时把非常驻工具（缺省 = `settings.json` 的 `defaultTools` 名单之外的工具）从 LLM 可见的 active 集剔除，粒度到单个工具，同一扩展里的工具可以部分隐藏；需要时由唯常驻入口 `omnify` 一步完成搜索、取用法与代理执行（四合一：原 load_tools / call_tool / skill_search 并入），执行逻辑始终是目标扩展自己的 `execute`。剔除之后，主 Agent 的上下文只保留它真正会用的工具，注意力不再被低频说明书占用。常驻名单与 pi 共用同一个 `defaultTools` 字段，不另建配置文件。因 tools 字段与系统提示词在会话内再也不变（铁律：会话内不写前缀），懒加载不造成任何缓存失效，任意模型通用（论证见[铁律：会话内不写前缀](#铁律会话内不写前缀)）。
 
 ## 目录
 
@@ -16,6 +16,7 @@ Skills 对同类问题的解法是渐进式披露（progressive disclosure）：
 - [设计细节与踩坑记录](#设计细节与踩坑记录)
 - [开发](#开发)
 - [License](#license)
+- [同族组件：路由而非激活](#同族组件路由而非激活)
 
 ## 快速上手
 
@@ -35,7 +36,7 @@ lazy-tools/
 ├── lazy-tools.ts        # 扩展入口：配置读取、session_start、omnify 单常驻
 ├── lazy-tools/
 │   └── core.ts          # 纯逻辑层：无 pi 依赖、无 typebox，可独立测试
-└── test/                # 84 个测试（node:test + tsx）
+└── test/                # 107 个测试（node:test + tsx）
     ├── core.test.ts
     ├── integration.test.ts
     └── fixtures/
@@ -178,6 +179,24 @@ Schema 预校验支持 type / required / enum / pattern / properties / additiona
 
 ## 工作原理
 
+### 铁律：会话内不写前缀
+
+> **`session_start` 之后，tools 字段与系统提示词都不再变。**
+>
+> 两者都是请求前缀的组成部分（tools 字段在序列化开头，系统提示词在它之前），中途改任何
+> 一处 = 那一轮及其后全部落到缓存之外；而且 pi ≥0.86 会把 active 工具的
+> `promptSnippet`/`promptGuidelines` 并进系统提示词，激活一个带 prompt 元数据的工具
+> 会让失效面从 tools 字段扩到整个系统提示词。
+>
+> 因此：**除 `session_start` 外，本扩展任何路径都不得调用 `pi.setActiveTools`，也不得改写
+> 任何已有 systemPrompt section**；一切提示只追加在消息流末尾。开发时的硬约束：往
+> `lazy-tools.ts` 里加任何 `setActiveTools` 调用之前，先问它会不会落在第一条请求之后。
+
+想让某个工具（或一整族工具）直接可见，只有两条路：写进 `settings.json` 的 `defaultTools`
+并在会话开始时定下来（不产生中途失效），或让插件自己声明 `exposure: "codemode"` /
+`"deferred"`（注册即可调，与 active 集无关，零前缀变化）。曾经存在的「同族整组激活」正是
+违反此铁律而被取消，见[同族组件：路由而非激活](#同族组件路由而非激活)。
+
 一次懒加载的完整调用链：
 
 ```
@@ -199,7 +218,7 @@ omnify({ goal: "...", args: {...} })（无 args = schema-first）
 
 四个设计要点：
 
-- session_start（首轮请求前）是唯一一次修改 tools 字段的动作，此后 tools 字段与系统提示词全程冻结
+- session_start（首轮请求前）是唯一一次修改 tools 字段的动作，此后 tools 字段与系统提示词全程冻结（铁律，见上）
 - omnify 无 args 时返回候选工具的参数 Schema（schema-first、零执行副作用），带 args 时 Schema 预校验后重放目标扩展 factory 捕获真实 execute 并执行，结果原样透传，全追加在消息流末尾，模型像读文档一样读到用法
 - 未匹配时返回全部工具名录与技能命中（SKILL.md 路径），并建议退回 bash/read/编辑 等常规手段
 - 因此懒加载不造成任何一次缓存失效，任意模型、任意 provider 通用（论证见下）
@@ -211,10 +230,10 @@ prompt cache 按前缀匹配：请求序列化后，与上一轮共享的前缀�
 
 本设计对两者的处理：
 
-- tools 字段只在 session_start 写一次（首轮请求前），此后冻结
+- tools 字段只在 session_start 写一次（首轮请求前），此后冻结（**铁律**：会话内不写前缀）
 - 系统提示词全程不变：lazy 工具从不激活，`promptSnippet`/`promptGuidelines` 结构性不会进入系统提示词；即便是 `defaultTools: []` 时本扩展主动补回的常驻内建基线，其 `promptSnippet`/`promptGuidelines` 也会被 `before_agent_start` 剥除，启用它不改变前缀
 
-会话内的消息增长全部发生在消息流末尾：omnify 的 schema-first 用法与其执行结果都是追加内容，追加不改变前缀。结论：本设计在任何模型、任何 provider 上，懒加载不造成任何一次缓存失效。
+会话内的消息增长全部发生在消息流末尾：omnify 的 schema-first 用法与其执行结果都是追加内容（同族路由提示也是），追加不改变前缀。结论：本设计在任何模型、任何 provider 上，懒加载不造成任何一次缓存失效。
 
 </details>
 
@@ -233,7 +252,7 @@ prompt cache 按前缀匹配：请求序列化后，与上一轮共享的前缀�
 1. 原生 deferred path 只有 Claude 4.5+（不含 Haiku）与 gpt-5.4+ 系支持；其余模型走 fallback，激活那一刻 tools 字段重建，缓存前缀失效一次
 2. 激活带 promptSnippet / promptGuidelines 的工具会重建系统提示词，这个变化位于 tools 字段之前，官方文档明确提示 lazy 工具应省略这些字段
 
-本设计的选择：目标工具永不激活，定义以文本形式出现在消息流里。任何模型、任何时刻，前缀不变。
+本设计的选择：**目标工具永不激活（铁律：会话内不写前缀）**，定义以文本形式出现在消息流里。任何模型、任何时刻，前缀不变。
 
 代价：
 
@@ -274,6 +293,8 @@ pi-lazy-extensions 按扩展粒度懒加载：jiti 动态 import 整个扩展模
 #### 3. promptGuidelines 会随工具激活重建系统提示词
 
 setActiveTools 激活一个带 promptGuidelines 的工具，系统提示词整体重建；即使 provider 支持原生 deferred schema，这个变化照样前缀失效。官方文档明确提示 lazy 工具应省略 prompt 元数据。对任何 setActiveTools 方案这都是隐藏的缓存杀手；本设计从不激活，天然绕开。本扩展唯一主动激活的常驻内建基线也做了处理：激活后在 `before_agent_start` 里剥掉其 prompt 元数据（见[为什么（几乎）不需要剥离系统提示词里的工具元数据](#为什么几乎不需要剥离系统提示词里的工具元数据)）。
+
+这就是铁律的现实依据：只要在会话中途激活过任何一个带 prompt 元数据的工具，零失效论证当场作废。同族组件功能（一度会 `setActiveTools` 整组激活）因此被取消，而不是靠「每组只激活一次」来将就。
 
 #### 4. pi 会吞掉 session_start handler 的异常
 
@@ -317,6 +338,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 - 工具没隐藏或 `omnify` 不存在：先开新会话（坑 2）
 - 「未找到工具元数据」：查启动参数有没有 `-t/--tools`、`-nt/--no-tools`、`-xt/--exclude-tools`（坑 1）
 - 名单不生效：查合并规则，项目级整体覆盖用户级（含空数组）
+- 有状态插件报 `Unknown runId` / 「属有状态同族」：本扩展已不激活工具（铁律），要么让插件声明 `exposure: "codemode"`，要么把整族写进 `defaultTools` 后重开会话
 - 升级 pi 或目标扩展后：回归目标扩展的核心调用链路；目标扩展工厂期行为若有变化，重评 createFakePi 打桩
 
 ### 参考
@@ -326,7 +348,7 @@ lazy 化的收益是让主 Agent 的上下文只保留真正会用到的工具�
 
 ## 开发
 
-测试位于 `test/`，84 个用例（52 单元 + 32 集成）：
+测试位于 `test/`，107 个用例（67 单元 + 40 集成）：
 
 ```bash
 cd pi-lazy-tools
@@ -335,22 +357,23 @@ npm test            # node --import tsx --test test/core.test.ts test/integratio
 npm run typecheck   # tsc --noEmit（严格模式）
 ```
 
-覆盖：配置合并、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、omnify 四合一接线（schema-first 零执行、显式指名、参数错误不执行、factory memoize、技能命中返 SKILL.md 路径、内建工具不进搜索池/强制常驻、显式指名内建工具返回可执行说明、启用内建基线时剥除其 prompt 元数据）。集成测试真实加载扩展源码。
+覆盖：配置合并、Schema 预校验边界（非法 pattern、无 type 的 object schema、`__proto__` 键、required 错误消息）、omnify 四合一接线（schema-first 零执行、显式指名、参数错误不执行、factory memoize、技能命中返 SKILL.md 路径、内建工具不进搜索池/强制常驻、显式指名内建工具返回可执行说明、启用内建基线时剥除其 prompt 元数据）、同族路由（启动不激活、命中后不调 `setActiveTools`、提示只追加一次、半组安装整族拒绝、走注册实例而非重放、有状态同族拒绝重放源码、自动成组只路由不激活、关闭同族后按无状态处理）。集成测试真实加载扩展源码。
 
 ## License
 
 MIT
-## 必备组件（同插件整组启用）
 
-有些扩展的多个工具共享内部状态（例如 `@arhen/pi-core-subagent` 的 `subagent` / `subagent_status` / `subagent_result` / `await_subagent` / `reply_subagent` / `steer_subagent` / `resume_subagent` / `subagent_cancel` 共用一个 `SubagentManager`）。这时只代理其中一个工具会在重放源码得到的**临时闭包**里建出第二份状态，于是 `subagent_status` 报 `Unknown runId`。
+## 同族组件：路由而非激活
 
-本扩展的处理：**命中任一成员即把整组工具按需启用**（`settings.json` 可配）：
+有些扩展的多个工具共享内部状态（例如 `@arhen/pi-core-subagent` 的 `subagent` / `subagent_status` / `subagent_result` / `await_subagent` / `reply_subagent` / `steer_subagent` / `resume_subagent` / `subagent_cancel` 共用一个 `SubagentManager`）。若在重放源码得到的**临时闭包**里代理其中一个工具，同族其余工具看到的是另一份状态，于是 `subagent_status` 报 `Unknown runId`。
+
+曾经的处理是「命中任一成员即整组 `setActiveTools` 进 active 集」。**现已取消**：那等于在会话中途改 tools 字段，也就是改请求前缀，违反[铁律](#铁律会话内不写前缀)。现在的三条规矩（`settings.json` 可配）：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `lazyToolCompanions` | `{ [工具名]: string[] }` | 显式声明必备组件。声明互通（`a` 列了 `b` ⇒ `b` 也带出 `a`），传递引用自动并入同一组。 |
+| `lazyToolCompanions` | `{ [工具名]: string[] }` | 显式声明同族。声明互通（`a` 列了 `b` ⇒ `b` 也带出 `a`），传递引用自动并入同一组。 |
 | `lazyToolAutoCompanions` | `boolean` | `true` 时按 `sourceInfo.path` 自动成组（同一扩展包即同组），单组超过 12 个工具不成组。 |
-| `lazyToolCompanionsMode` | `"activate" \| "off"` | `"off"`（或 `lazyToolCompanions: false`）彻底关闭整组启用。 |
+| `lazyToolCompanionsMode` | `"route" \| "off"` | `"off"`（或 `lazyToolCompanions: false`）关闭同族识别：既不提示路由，也允许按无状态工具重放源码。旧的 `"activate"` 值等同 `"route"`（激活行为已取消，见上文）。 |
 
 示例：
 
@@ -371,13 +394,15 @@ MIT
 }
 ```
 
-行为边界（刻意保守，都是为了前缀与正确性）：
+行为边界（都是零前缀成本）：
 
-- **不在 session_start 激活任何东西**：组只在 `session_start` 里被算出来，不动 active 集；首个请求的 tools 字段与配置无关。
-- **只追加**：不改写任何已有系统提示词 section；激活告知只追加在工具结果末尾的 content block（`[已随 X 一并启用同族必备工具：…]`），并记在 `details.activatedCompanions`。
-- **每组每会话只 `setActiveTools` 一次**：重复调用不再动 tools 字段，避免反复扰动前缀缓存。
-- **全有或全无**：组内任何成员不在注册表（被 `-t` 裁掉 / 扩展没加载）就整组拒绝，并点名缺哪个——半组可用会以 `Unknown runId` 之类的假故障收场，比整组不可用更糟。
-- **优先走 `ctx.executeTool`**（pi ≥ 0.99）：激活后若工具在 `ctx.tools` 里，就执行注册表里的真实实例（有状态扩展的事件/widget/persist 全部有效），不再重放源码；旧宿主才回落重放。
-- **免声明的组不激活**：若组内工具全是 `exposure: "codemode" | "deferred"`（注册即可调，与 active 集无关），本扩展只走 `ctx.executeTool`，**全程零请求侧变化**。这也是 provider 不支持动态 tools 时最省的做法：把有状态扩展的工具声明成 `codemode`，就永远不需要激活。
+- **不激活任何东西**：组只在 `session_start` 里被算出来，不动 active 集；同族工具始终留在 lazy 侧，只能经 `omnify({ tool: "子工具名", args })` 指名调用。
+- **只追加**：不改写任何已有系统提示词 section；路由提示只追加在工具结果末尾的 content block（`[X 与 a, b 共享内部状态（同族）…]`），并记在 `details.companionPeers`。
+- **每组每会话只提示一次**：重复调用不再追加提示，避免刷屏。
+- **优先走 `ctx.executeTool`**（pi ≥ 0.99）：那是注册表里的真实实例（有状态扩展的事件/widget/persist 全部有效），不再重放源码；旧宿主才回落重放。
+- **有状态同族拿不到注册实例时明确失败**：宁可报错，也不重放源码造第二份状态。失败文案给出两条出路——插件自己声明 `exposure: "codemode" | "deferred"`，或把整族写进 `defaultTools` 后重开会话。
+- **半组安装一律拒绝**：组内成员不全在注册表（被 `-t` 裁掉 / 扩展没加载）就整族拒绝并点名缺哪个——代理半个家族只会得到 `Unknown runId` 之类的假故障，比整族不可用更糟。
+- **免声明的组零变化**：若组内工具全是 `exposure: "codemode" | "deferred"`（注册即可调，与 active 集无关），既不提示也不做执行限制，全程零请求侧变化。**有状态扩展的零成本解法就是这个**：让插件自己声明 `codemode`，别指望本扩展去激活它。
 
-代价：一次整组启用 = 一次请求级 tools 变更 = 至多一次前缀失效（此后该组不再变动）。想要真正零变化，请让插件自己声明 `exposure: "codemode"`，本扩展会自动识别并跳过激活。
+代价：同族成员每次使用都多一轮 omnify 指名调用（目标工具本身本来就有这一轮）。换回的是整会话 tools 字段零变动。
+

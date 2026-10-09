@@ -377,20 +377,26 @@ export function isAlwaysCallableExposure(exposure: string | undefined): boolean 
 	return exposure === "codemode" || exposure === "deferred";
 }
 
-/* ───────────────────────── 必备组件（companion groups） ─────────────────────────
+/* ───────────────────────── 同族组件（companion groups） ─────────────────────────
  * 有状态的多工具扩展，成员之间互为前提：subagent 起了 run，subagent_status /
- * subagent_result / await_subagent 才能读它；只启用一半就会得到 Unknown runId 这类
- * 假故障。故命中任一成员即整组一起进 active 集，且必须「全有或全无」。
+ * subagent_result / await_subagent 才能读它；代理其中一个就会在重放源码得到的
+ * **临时闭包**里建出第二份状态，于是 status 报 Unknown runId 这类假故障。
+ *
+ * 曾经的解法是「命中任一成员即整组 setActiveTools 进 active 集」，现已取消：
+ * 那等于在会话中途改 tools 字段——也就是改请求前缀（铁律：不写前缀）。现在的解法：
+ *   1. 执行优先 ctx.executeTool（注册表里的真实实例，事件/widget/persist 全活）；
+ *   2. 拿不到真实实例又属有状态同族 → 拒绝代理（不重放源码），并说清出路；
+ *   3. 组信息只用来在结果尾部追加一条「同族须指名」路由提示（消息流末尾，不碰前缀）。
  */
 
-/** 一个必备组件组：key 为组标识（显式组名或来源路径），members 为组内工具名。 */
+/** 一个同族组件组：key 为组标识（显式组名或来源路径），members 为组内工具名。 */
 export interface CompanionGroup {
 	key: string;
 	members: string[];
 	/**
-	 * 是否必须把工具声明给模型才能调用。
-	 * false = 组内全是 codemode/deferred 曝光（注册即可调，与 active 集无关），
-	 *         这类组全程零请求变化、无需激活。
+	 * 组内是否存在「需要 active 集才可见」的工具。
+	 * false = 组内全是 codemode/deferred 曝光（注册即可调，与 active 集无关）：模型能直接调，
+	 *         omnify 也能直调注册实例 → 全程零请求侧变化，是有状态扩展的唯一零成本解法。
 	 */
 	needsDeclaration: boolean;
 }
@@ -488,27 +494,46 @@ for (const comp of comps.values()) {
 	return out;
 }
 
-export interface GroupActivationPlan {
-	/** 本次需要追加进 active 集的名字（组内顺序、去重、幂等）。 */
-	toActivate: string[];
+export interface CompanionRoutingPlan {
+	/** 组内除命中工具外的其他成员（字典序），供 omnify 追加「同族须指名」路由提示。 */
+	peers: string[];
+	/** 组内需要 active 集才可见（非 codemode/deferred）的成员名——只用于判断执行策略。 */
+	declarationNeeded: boolean;
 }
 
 /**
- * 整组激活计划：全有或全无。
- * 组内任何成员已不在注册表（被 -t 裁掉 / 扩展没加载）即拒绝激活——半组可用比全组
- * 不可用更糟：调用会以 Unknown runId 之类的假故障收场。
+ * 同族路由计划：**纯只读**，绝不碰 active 集。
+ *
+ * 铁律（见 README「工作原理」）：第一条请求发出之后，tools 字段与系统提示词永不再变——
+ * 它们是请求前缀的一部分，改一次就是一次缓存失效（pi ≥0.86 还会把 active 工具的
+ * promptSnippet/promptGuidelines 并进系统提示词，失效面更大）。故「整组激活」已取消：
+ * 同族工具一律留在 lazy 侧，由 omnify 指名路由；执行优先走 ctx.executeTool 的注册实例
+ * （活状态），有状态家族绝不重放源码（会造第二份状态，报 Unknown runId 之类假故障）。
+ *
+ * 半组安装（有成员不在注册表）仍一律拒绝：代理半个家族只会得到假故障，比整族不可用更糟。
  */
-export function planGroupActivation(input: {
+export function planCompanionRouting(input: {
 	group: CompanionGroup;
 	registered: ReadonlySet<string>;
-	active: ReadonlySet<string>;
-}): { ok: true; plan: GroupActivationPlan } | { ok: false; reason: string } {
+	self: string;
+}): { ok: true; plan: CompanionRoutingPlan } | { ok: false; reason: string } {
 	const missing = input.group.members.filter((m) => !input.registered.has(m));
 	if (missing.length > 0) {
-		return { ok: false, reason: `必备组件未注册（被 -t 裁掉或扩展未加载）：${missing.join(", ")}` };
+		return {
+			ok: false,
+			reason:
+				`同族未装齐（不在注册表，可能被 -t 裁掉或扩展未加载）：${missing.join(", ")}；` +
+				"本会话不改 active 集（不写前缀），故无法代理半个家族——请把整族加入 " +
+				`settings.json 的 defaultTools 并重开会话。`,
+		};
 	}
-	const toActivate = input.group.members.filter((m) => !input.active.has(m));
-	return { ok: true, plan: { toActivate } };
+	return {
+		ok: true,
+		plan: {
+			peers: input.group.members.filter((m) => m !== input.self),
+			declarationNeeded: input.group.needsDeclaration,
+		},
+	};
 }
 
 /**

@@ -20,7 +20,7 @@ import {
 	PI_BUILTIN_DEFAULT_TOOLS,
 	nonLoadableSourceReason,
 	resolveCompanionGroups,
-	planGroupActivation,
+	planCompanionRouting,
 	AUTO_COMPANION_GROUP_MAX,
 } from "../lazy-tools/core.ts";
 // 类型导出：node 原生类型擦除（无 tsx）不保留 type-only 导出，故须 import type。
@@ -650,7 +650,7 @@ describe("nonLoadableSourceReason", () => {
 	});
 });
 
-describe("必备组件组（companion groups）", () => {
+	describe("同族组（companion groups）", () => {
 	const subagentTools = [
 		{ name: "subagent", sourcePath: "pkg/subagent/index.ts" },
 		{ name: "subagent_status", sourcePath: "pkg/subagent/index.ts" },
@@ -718,41 +718,40 @@ describe("必备组件组（companion groups）", () => {
 		assert.equal(resolveCompanionGroups({ tools: many, auto: true }).size, 0);
 	});
 
-	it("should activate the whole group in one plan, skipping already-active members", () => {
+		it("should plan routing without touching the active set (no prefix writes)", () => {
 		const groups = resolveCompanionGroups({
 			tools: subagentTools,
 			configured: { subagent: ["subagent_status", "subagent_result"] },
 		});
 		const group = groups.get("subagent")!;
 		const registered = new Set(subagentTools.map((t) => t.name));
-		const planned = planGroupActivation({ group, registered, active: new Set(["subagent_status"]) });
+		const planned = planCompanionRouting({ group, registered, self: "subagent" });
 		assert.equal(planned.ok, true);
-		assert.ok(planned.ok && planned.plan.toActivate.length === 2);
-		assert.ok(planned.ok && !planned.plan.toActivate.includes("subagent_status"));
+		assert.ok(planned.ok);
+		assert.deepEqual(planned.plan.peers, ["subagent_result", "subagent_status"], "同族成员（不含自己）");
+		assert.equal(planned.plan.declarationNeeded, true);
 	});
 
-	it("should be a no-op plan when the group is already fully active", () => {
+	it("should be an empty routing plan when the family is not stateful", () => {
 		const groups = resolveCompanionGroups({ tools: subagentTools, auto: true });
 		const group = groups.get("subagent")!;
 		const registered = new Set(subagentTools.map((t) => t.name));
-		const planned = planGroupActivation({
-			group,
-			registered,
-			active: new Set(subagentTools.map((t) => t.name)),
-		});
-		assert.ok(planned.ok && planned.plan.toActivate.length === 0);
+		const planned = planCompanionRouting({ group, registered, self: "subagent" });
+		assert.ok(planned.ok);
+		assert.deepEqual(planned.plan.peers, ["await_subagent", "subagent_result", "subagent_status"]);
 	});
 
-	it("should refuse the whole group when any member is missing from the registry", () => {
+	it("should refuse the whole family when any member is missing from the registry", () => {
 		const groups = resolveCompanionGroups({ tools: subagentTools, auto: true });
 		const group = groups.get("subagent")!;
-		const planned = planGroupActivation({
+		const planned = planCompanionRouting({
 			group,
 			registered: new Set(["subagent", "subagent_status"]),
-			active: new Set<string>(),
+			self: "subagent",
 		});
 		assert.equal(planned.ok, false);
-		assert.match(planned.ok ? "" : planned.reason, /必备组件未注册.*await_subagent/);
+		assert.match(planned.ok ? "" : planned.reason, /同族未装齐.*await_subagent/);
+		assert.match(planned.ok ? "" : planned.reason, /不写前缀|不改 active 集/, "拒绝文案应说清为什么不激活");
 	});
 });
 
